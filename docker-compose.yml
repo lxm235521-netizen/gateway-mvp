@@ -1,0 +1,15 @@
+services:
+  gateway:
+    build: .
+    environment:
+      PORT: 3000
+      DB_HOST: ${DB_HOST:-154.36.173.77}
+      DB_PORT: ${DB_PORT:-3310}
+      DB_NAME: ${DB_NAME:-gateway}
+      DB_USER: ${DB_USER:-gateway}
+      DB_PASSWORD: ${DB_PASSWORD:-gateway-password}
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASS: ${ADMIN_PASS:-change-me-admin-password}
+    ports:
+      - "3000:3000"
+    restart: unless-stopped

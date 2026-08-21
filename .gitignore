@@ -1,0 +1,7 @@
+node_modules/
+.env
+gateway.db
+mysql_data/
+*.log
+npm-debug.log*
+.DS_Store

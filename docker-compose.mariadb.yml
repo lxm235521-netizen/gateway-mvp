@@ -1,0 +1,32 @@
+services:
+  mariadb:
+    image: mariadb:10.5
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --innodb_buffer_pool_size=1024M
+      - --max_connections=200
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-me-root-password}
+      MYSQL_DATABASE: ${DB_NAME:-gateway}
+      MYSQL_USER: ${DB_USER:-gateway}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-gateway-password}
+    ports:
+      - "3310:3306"
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-change-me-root-password}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - gateway_net
+    restart: always
+
+networks:
+  gateway_net:
+    name: gateway_net
