@@ -2,7 +2,6 @@ const express = require("express");
 const axios = require("axios");
 const jsonata = require("jsonata");
 const morgan = require("morgan");
-const crypto = require("crypto");
 const path = require("path");
 const db = require("./db");
 
@@ -104,10 +103,13 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
         const gwResponse = await executeMapping(modelRecord.resp_mapping, upstreamRes.data);
         
         if (modelRecord.is_async) {
-            const gwTaskId = "task_" + crypto.randomBytes(16).toString("hex");
-            const upTaskId = gwResponse.task_id || "unknown";
-            
-            await db.run("INSERT INTO async_tasks (gw_task_id, up_task_id, gw_key_id, model_id) VALUES (?, ?, ?, ?)", 
+            const upTaskId = gwResponse.task_id;
+            if (!upTaskId) {
+                return res.status(502).json({ error: "Upstream task ID mapping is missing" });
+            }
+            const gwTaskId = upTaskId;
+
+            await db.run("INSERT INTO async_tasks (gw_task_id, up_task_id, gw_key_id, model_id) VALUES (?, ?, ?, ?)",
                 [gwTaskId, upTaskId, req.gatewayKey.id, modelRecord.id]);
             
             await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
