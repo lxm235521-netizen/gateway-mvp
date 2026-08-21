@@ -3,13 +3,13 @@ services:
     build: .
     environment:
       PORT: 3000
-      DB_HOST: ${DB_HOST:-154.36.173.77}
-      DB_PORT: ${DB_PORT:-3310}
-      DB_NAME: ${DB_NAME:-gateway}
-      DB_USER: ${DB_USER:-gateway}
-      DB_PASSWORD: ${DB_PASSWORD:-gateway-password}
-      ADMIN_USER: ${ADMIN_USER:-admin}
-      ADMIN_PASS: ${ADMIN_PASS:-change-me-admin-password}
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      ADMIN_USER: ${ADMIN_USER}
+      ADMIN_PASS: ${ADMIN_PASS}
     ports:
       - "3009:3000"
     restart: unless-stopped
