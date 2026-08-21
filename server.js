@@ -136,14 +136,6 @@ app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
         if (!taskRecord) {
             return res.status(404).json({ error: "Task not found" });
         }
-        if (taskRecord.status === 'completed' || taskRecord.status === 'failed') {
-            return res.json({
-                id: taskRecord.gw_task_id,
-                status: taskRecord.status,
-                message: "Task is already resolved."
-            });
-        }
-
         const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?", [taskRecord.model_id]);
         
         let upPollPath = modelRecord.poll_path || "/";
