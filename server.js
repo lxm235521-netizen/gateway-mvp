@@ -139,33 +139,69 @@ app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
             return res.status(404).json({ error: "Task not found" });
         }
         const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?", [taskRecord.model_id]);
-        
+
         let upPollPath = modelRecord.poll_path || "/";
         upPollPath = upPollPath.replace("${up_task_id}", taskRecord.up_task_id);
-        
+
         const upstreamUrl = modelRecord.base_url + upPollPath;
         const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
-        
+
         const upstreamRes = await axios.get(upstreamUrl, {
             headers: { "Authorization": `Bearer ${upstreamKey}` }
         });
 
         const pollResult = await executeMapping(modelRecord.poll_mapping, upstreamRes.data);
-        
+
         pollResult.id = taskRecord.gw_task_id;
         pollResult.task_id = taskRecord.gw_task_id;
 
         if (pollResult.status === "completed") {
             await db.run("UPDATE async_tasks SET status = 'completed' WHERE gw_task_id = ?", [task_id]);
-        } 
+        }
         else if (pollResult.status === "failed") {
             await db.run("UPDATE async_tasks SET status = 'failed' WHERE gw_task_id = ?", [task_id]);
             await db.run("UPDATE gateway_keys SET used_quota = used_quota - 1 WHERE id = ?", [taskRecord.gw_key_id]);
         }
-        
+
         return res.json(pollResult);
     } catch (error) {
         console.error("[Gateway GET Error]", error.message);
+        res.status(500).json({ error: "Failed to poll upstream status" });
+    }
+});
+
+app.get("/v1/videos/:task_id/content", authMiddleware, async (req, res) => {
+    const { task_id } = req.params;
+    try {
+        const taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [task_id]);
+        if (!taskRecord) {
+            return res.status(404).json({ error: "Task not found" });
+        }
+        const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?", [taskRecord.model_id]);
+
+        let upPollPath = modelRecord.poll_path || "/";
+        upPollPath = upPollPath.replace("${up_task_id}", taskRecord.up_task_id);
+
+        const upstreamUrl = modelRecord.base_url + upPollPath;
+        const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
+
+        const upstreamRes = await axios.get(upstreamUrl, {
+            headers: { "Authorization": `Bearer ${upstreamKey}` }
+        });
+
+        const pollResult = await executeMapping(modelRecord.poll_mapping, upstreamRes.data);
+        const videoUrl = pollResult && pollResult.status === "completed" ? (pollResult.video_url || "") : "";
+
+        if (pollResult.status === "completed") {
+            await db.run("UPDATE async_tasks SET status = 'completed' WHERE gw_task_id = ?", [task_id]);
+        } else if (pollResult.status === "failed") {
+            await db.run("UPDATE async_tasks SET status = 'failed' WHERE gw_task_id = ?", [task_id]);
+            await db.run("UPDATE gateway_keys SET used_quota = used_quota - 1 WHERE id = ?", [taskRecord.gw_key_id]);
+        }
+
+        return res.status(200).type("application/json").json({ url: videoUrl });
+    } catch (error) {
+        console.error("[Gateway GET Content Error]", error.message);
         res.status(500).json({ error: "Failed to poll upstream status" });
     }
 });
