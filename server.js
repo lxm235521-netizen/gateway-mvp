@@ -1,13 +1,28 @@
-const express = require("express");
+﻿const express = require("express");
 const axios = require("axios");
+const FormData = require("form-data");
 const jsonata = require("jsonata");
 const morgan = require("morgan");
 const path = require("path");
 const db = require("./db");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "50mb" }));
 app.use(morgan("dev"));
+
+const MULTIPART_FORMATS = new Set(["multipart", "multipart/form-data", "form-data"]);
+const MULTIPART_META_KEYS = new Set([
+    "_route_path",
+    "route_path",
+    "_request_format",
+    "request_format",
+    "_content_type",
+    "content_type",
+    "files",
+    "fields",
+    "_file_fields",
+    "file_fields"
+]);
 
 const adminRouter = require("./admin-api")(db);
 app.use("/admin", adminRouter);
@@ -55,6 +70,230 @@ async function executeMapping(mappingTemplate, data) {
     }
 }
 
+function isObject(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function getRequestFormat(payload) {
+    if (!isObject(payload)) {
+        return "json";
+    }
+    return String(payload._request_format || payload.request_format || payload._content_type || payload.content_type || "json").toLowerCase();
+}
+
+function isMultipartPayload(payload) {
+    return MULTIPART_FORMATS.has(getRequestFormat(payload));
+}
+
+function getPayloadRoutePath(payload) {
+    if (!isObject(payload)) {
+        return null;
+    }
+    const routePath = payload._route_path || payload.route_path;
+    if (!routePath) {
+        return null;
+    }
+    const normalized = String(routePath);
+    return normalized.startsWith("/") ? normalized : "/" + normalized;
+}
+
+function stripGatewayMeta(payload) {
+    if (!isObject(payload)) {
+        return payload;
+    }
+    return Object.fromEntries(Object.entries(payload).filter(([key]) => !MULTIPART_META_KEYS.has(key)));
+}
+
+function resolveUpstreamUrl(modelRecord, upstreamPayload) {
+    return modelRecord.base_url + (getPayloadRoutePath(upstreamPayload) || modelRecord.route_path);
+}
+
+function appendFormField(form, key, value) {
+    if (value === undefined) {
+        return;
+    }
+    if (Array.isArray(value)) {
+        value.forEach(item => appendFormField(form, key, item));
+        return;
+    }
+    if (value === null) {
+        form.append(key, "");
+        return;
+    }
+    form.append(key, isObject(value) ? JSON.stringify(value) : String(value));
+}
+
+function getFileExtension(contentType) {
+    const type = String(contentType || "").split(";")[0].trim().toLowerCase();
+    const extensions = {
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+        "image/gif": "gif",
+        "application/pdf": "pdf",
+        "text/plain": "txt"
+    };
+    return extensions[type] || "bin";
+}
+
+function sanitizeFilename(filename, fallback) {
+    const candidate = filename ? path.basename(String(filename)) : fallback;
+    return (candidate || fallback).replace(/[\r\n"]/g, "_");
+}
+
+function getFilenameFromUrl(fileUrl, fallback) {
+    try {
+        const parsed = new URL(fileUrl);
+        const basename = path.basename(decodeURIComponent(parsed.pathname || ""));
+        return sanitizeFilename(basename, fallback);
+    } catch (error) {
+        return fallback;
+    }
+}
+
+function getFilenameFromDisposition(disposition) {
+    if (!disposition) {
+        return null;
+    }
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match) {
+        return decodeURIComponent(utf8Match[1]);
+    }
+    const asciiMatch = disposition.match(/filename="?([^";]+)"?/i);
+    return asciiMatch ? asciiMatch[1] : null;
+}
+
+function parseDataUrl(source) {
+    const match = String(source).match(/^data:([^;,]+)?(;base64)?,([\s\S]*)$/);
+    if (!match) {
+        return null;
+    }
+    const contentType = match[1] || "application/octet-stream";
+    const isBase64 = Boolean(match[2]);
+    const data = isBase64 ? match[3] : decodeURIComponent(match[3]);
+    return {
+        buffer: Buffer.from(data, isBase64 ? "base64" : "utf8"),
+        contentType
+    };
+}
+
+async function appendFilePart(form, field, fileSpec, index = 0) {
+    const spec = isObject(fileSpec) ? fileSpec : { source: fileSpec };
+    const source = spec.source || spec.url || spec.base64 || spec.data;
+    if (!source) {
+        return;
+    }
+
+    const fallbackName = `${field}-${index + 1}.bin`;
+    const contentType = spec.content_type || spec.contentType || "application/octet-stream";
+
+    if (typeof source === "string" && source.startsWith("data:")) {
+        const parsed = parseDataUrl(source);
+        if (!parsed) {
+            throw new Error(`Invalid data URL for multipart field ${field}`);
+        }
+        const filename = sanitizeFilename(spec.filename, `${field}-${index + 1}.${getFileExtension(parsed.contentType)}`);
+        form.append(field, parsed.buffer, { filename, contentType: parsed.contentType });
+        return;
+    }
+
+    if (typeof source === "string" && /^https:\/\//i.test(source)) {
+        const fileRes = await axios.get(source, {
+            responseType: "stream",
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity
+        });
+        const responseType = fileRes.headers["content-type"] || contentType;
+        const dispositionName = getFilenameFromDisposition(fileRes.headers["content-disposition"]);
+        const filename = sanitizeFilename(spec.filename || dispositionName || getFilenameFromUrl(source, fallbackName), fallbackName);
+        form.append(field, fileRes.data, { filename, contentType: responseType });
+        return;
+    }
+
+    if (typeof source === "string" && /^http:\/\//i.test(source)) {
+        throw new Error(`Only https file URLs are supported for multipart field ${field}`);
+    }
+
+    const filename = sanitizeFilename(spec.filename, `${field}-${index + 1}.${getFileExtension(contentType)}`);
+    const encoding = spec.encoding || "base64";
+    const buffer = Buffer.isBuffer(source) ? source : Buffer.from(String(source), encoding);
+    form.append(field, buffer, { filename, contentType });
+}
+
+function normalizeFileEntries(files) {
+    if (!files) {
+        return [];
+    }
+    if (Array.isArray(files)) {
+        return files.flatMap(item => {
+            if (!isObject(item)) {
+                return [];
+            }
+            const field = item.field || item.name;
+            if (!field) {
+                return [];
+            }
+            const values = item.items || item.values || item.files;
+            if (Array.isArray(values)) {
+                return values.map(value => ({ field, value: isObject(value) ? { ...value, field } : { source: value } }));
+            }
+            return [{ field, value: item }];
+        });
+    }
+    if (isObject(files)) {
+        return Object.entries(files).flatMap(([field, value]) => {
+            const values = Array.isArray(value) ? value : [value];
+            return values.map(item => ({ field, value: isObject(item) ? { ...item, field } : { source: item } }));
+        });
+    }
+    return [];
+}
+
+async function buildMultipartRequest(payload) {
+    const form = new FormData();
+    const fieldValues = isObject(payload.fields) ? payload.fields : Object.fromEntries(
+        Object.entries(payload).filter(([key]) => !MULTIPART_META_KEYS.has(key))
+    );
+    const fileFields = payload._file_fields || payload.file_fields || [];
+    const fileFieldSet = new Set(Array.isArray(fileFields) ? fileFields : [fileFields]);
+
+    Object.entries(fieldValues).forEach(([key, value]) => {
+        if (!fileFieldSet.has(key)) {
+            appendFormField(form, key, value);
+        }
+    });
+
+    const fileEntries = normalizeFileEntries(payload.files);
+    fileFieldSet.forEach(field => {
+        const value = payload[field] || (payload.fields && payload.fields[field]);
+        const values = Array.isArray(value) ? value : [value];
+        values.filter(item => item !== undefined).forEach(item => fileEntries.push({ field, value: item }));
+    });
+
+    for (let index = 0; index < fileEntries.length; index += 1) {
+        await appendFilePart(form, fileEntries[index].field, fileEntries[index].value, index);
+    }
+
+    return form;
+}
+
+async function buildPostOptions(upstreamKey, upstreamPayload) {
+    const headers = { "Authorization": `Bearer ${upstreamKey}` };
+    if (!isMultipartPayload(upstreamPayload)) {
+        return { data: stripGatewayMeta(upstreamPayload), options: { headers } };
+    }
+
+    const form = await buildMultipartRequest(upstreamPayload);
+    return {
+        data: form,
+        options: {
+            headers: { ...headers, ...form.getHeaders() },
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity
+        }
+    };
+}
+
 app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
     const { model } = req.body;
     try {
@@ -65,15 +304,14 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
 
         const upstreamPayload = await executeMapping(modelRecord.req_mapping, req.body);
         const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
-        const upstreamUrl = modelRecord.base_url + modelRecord.route_path;
+        const upstreamUrl = resolveUpstreamUrl(modelRecord, upstreamPayload);
         
         console.log('[Gateway POST completions] Routing to: ' + upstreamUrl);
         
         await db.run('UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?', [req.gatewayKey.id]);
 
-        const upstreamRes = await axios.post(upstreamUrl, upstreamPayload, {
-            headers: { 'Authorization': 'Bearer ' + upstreamKey }
-        });
+        const postRequest = await buildPostOptions(upstreamKey, upstreamPayload);
+        const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
 
         const gwResponse = await executeMapping(modelRecord.resp_mapping, upstreamRes.data);
         res.json(gwResponse);
@@ -83,6 +321,31 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
     }
 });
 
+app.post(["/v1/images/generations", "/v1/images/edits"], authMiddleware, async (req, res) => {
+    const { model } = req.body;
+    try {
+        const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.model_name = ? AND m.status = 1", [model]);
+        if (!modelRecord) {
+            return res.status(404).json({ error: "Model not found or disabled" });
+        }
+
+        const upstreamPayload = await executeMapping(modelRecord.req_mapping, req.body);
+        const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
+        const upstreamUrl = resolveUpstreamUrl(modelRecord, upstreamPayload);
+
+        console.log(`[Gateway POST images] Routing to: ${upstreamUrl}`);
+        const postRequest = await buildPostOptions(upstreamKey, upstreamPayload);
+        const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
+
+        await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
+
+        const gwResponse = await executeMapping(modelRecord.resp_mapping, upstreamRes.data);
+        return res.json(gwResponse);
+    } catch (error) {
+        console.error("[Gateway POST Images Error]", error.response ? error.response.data : error.message);
+        res.status(500).json({ error: "Upstream request failed", details: error.message });
+    }
+});
 app.post("/v1/videos", authMiddleware, async (req, res) => {
     const { model } = req.body;
     try {
@@ -93,12 +356,11 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
 
         const upstreamPayload = await executeMapping(modelRecord.req_mapping, req.body);
         const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
-        const upstreamUrl = modelRecord.base_url + modelRecord.route_path;
+        const upstreamUrl = resolveUpstreamUrl(modelRecord, upstreamPayload);
         
         console.log(`[Gateway POST] Routing to: ${upstreamUrl}`);
-        const upstreamRes = await axios.post(upstreamUrl, upstreamPayload, {
-            headers: { "Authorization": `Bearer ${upstreamKey}` }
-        });
+        const postRequest = await buildPostOptions(upstreamKey, upstreamPayload);
+        const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
 
         const gwResponse = await executeMapping(modelRecord.resp_mapping, upstreamRes.data);
         
@@ -219,3 +481,4 @@ start().catch(error => {
     console.error("Failed to start gateway:", error.message);
     process.exit(1);
 });
+
