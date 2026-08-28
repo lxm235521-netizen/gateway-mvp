@@ -8,7 +8,7 @@
     <script src="https://cdn.jsdelivr.net/npm/element-plus@2.3.14/dist/index.full.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@element-plus/icons-vue@2.1.0/dist/index.iife.min.js"></script>
     <style>
-        body { font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif; margin: 0; background-color: #f0f2f5; }
+        body { font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif; margin: 0; background-color: #f0f2f5; }
         .login-container { display: flex; justify-content: center; align-items: center; height: 100vh; }
         .login-card { width: 400px; padding: 20px; }
         .admin-container { display: flex; height: 100vh; }
@@ -17,518 +17,319 @@
         .el-menu-vertical { border-right: none; background-color: #304156; }
         .el-menu-item { color: #bfcbd9; }
         .el-menu-item.is-active { color: #409EFF; }
-        .visual-box { border: 1px solid #dcdfe6; padding: 15px; margin-bottom: 15px; border-radius: 4px; background: #fafafa; }
+        .binding-card { border: 1px solid #dcdfe6; border-radius: 6px; padding: 14px; margin-bottom: 14px; background: #fff; }
+        .binding-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        .mono textarea { font-family: Consolas, Monaco, monospace; }
     </style>
 </head>
 <body>
-    <div id="app">
-        
-        <div v-if="!isLoggedIn" class="login-container">
-            <el-card class="login-card">
-                <template #header>
-                    <div class="card-header">
-                        <h2>AI Gateway 管理后台</h2>
-                    </div>
-                </template>
-                <el-form :model="loginForm" @keyup.enter="login">
-                    <el-form-item>
-                        <el-input v-model="loginForm.username" placeholder="用户名"><template #prefix><el-icon><icon-user></icon-user></el-icon></template></el-input>
-                    </el-form-item>
-                    <el-form-item>
-                        <el-input v-model="loginForm.password" type="password" placeholder="密码" show-password><template #prefix><el-icon><icon-lock></icon-lock></el-icon></template></el-input>
-                    </el-form-item>
-                    <el-button type="primary" style="width: 100%;" @click="login" :loading="loading">登 录</el-button>
-                </el-form>
-            </el-card>
+<div id="app">
+    <div v-if="!isLoggedIn" class="login-container">
+        <el-card class="login-card">
+            <template #header><h2>AI Gateway 管理后台</h2></template>
+            <el-form :model="loginForm" @keyup.enter="login">
+                <el-form-item><el-input v-model="loginForm.username" placeholder="用户名"></el-input></el-form-item>
+                <el-form-item><el-input v-model="loginForm.password" type="password" placeholder="密码" show-password></el-input></el-form-item>
+                <el-button type="primary" style="width: 100%;" @click="login" :loading="loading">登 录</el-button>
+            </el-form>
+        </el-card>
+    </div>
+
+    <div v-else class="admin-container">
+        <div class="sidebar">
+            <div style="padding: 20px; text-align: center; font-size: 18px; font-weight: bold;">AI Gateway</div>
+            <el-menu :default-active="activeTab" class="el-menu-vertical" @select="handleSelect">
+                <el-menu-item index="models"><span>模型与映射</span></el-menu-item>
+                <el-menu-item index="channels"><span>上游渠道管理</span></el-menu-item>
+                <el-menu-item index="keys"><span>网关密钥分发</span></el-menu-item>
+                <el-menu-item index="logout" @click="logout"><span>退出登录</span></el-menu-item>
+            </el-menu>
         </div>
 
-        
-        <div v-else class="admin-container">
-            
-            <div class="sidebar">
-                <div style="padding: 20px; text-align: center; font-size: 18px; font-weight: bold;">AI Gateway</div>
-                <el-menu :default-active="activeTab" class="el-menu-vertical" @select="handleSelect">
-                    <el-menu-item index="models">
-                        <el-icon><icon-connection></icon-connection></el-icon>
-                        <span>模型与映射</span>
-                    </el-menu-item>
-                    <el-menu-item index="channels">
-                        <el-icon><icon-monitor></icon-monitor></el-icon>
-                        <span>上游渠道管理</span>
-                    </el-menu-item>
-                    <el-menu-item index="keys">
-                        <el-icon><icon-key></icon-key></el-icon>
-                        <span>网关密钥分发</span>
-                    </el-menu-item>
-                    <el-menu-item index="logout" @click="logout">
-                        <el-icon><icon-switchbutton></icon-switchbutton></el-icon>
-                        <span>退出登录</span>
-                    </el-menu-item>
-                </el-menu>
+        <div class="main-content">
+            <div v-if="activeTab === 'models'">
+                <div style="margin-bottom: 20px;"><el-button type="primary" @click="openModelDialog()">新增逻辑模型</el-button></div>
+                <el-table :data="models" border style="width: 100%">
+                    <el-table-column type="expand">
+                        <template #default="scope">
+                            <el-table :data="scope.row.bindings" border size="small">
+                                <el-table-column prop="id" label="绑定ID" width="80"></el-table-column>
+                                <el-table-column prop="channel_name" label="渠道" width="160"></el-table-column>
+                                <el-table-column prop="route_path" label="请求路由"></el-table-column>
+                                <el-table-column prop="weight" label="权重" width="80"></el-table-column>
+                                <el-table-column label="任务" width="90"><template #default="b"><el-tag :type="b.row.is_async ? 'warning' : 'success'">{{ b.row.is_async ? '异步' : '同步' }}</el-tag></template></el-table-column>
+                                <el-table-column label="状态" width="100"><template #default="b"><el-tag :type="b.row.status && b.row.channel_status ? 'success' : 'danger'">{{ b.row.status && b.row.channel_status ? '可用' : '禁用' }}</el-tag></template></el-table-column>
+                            </el-table>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="id" label="ID" width="70"></el-table-column>
+                    <el-table-column prop="model_name" label="下游模型名"></el-table-column>
+                    <el-table-column label="绑定渠道数" width="120"><template #default="scope">{{ scope.row.bindings ? scope.row.bindings.length : 0 }}</template></el-table-column>
+                    <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status ? 'success' : 'danger'">{{ scope.row.status ? '启用' : '禁用' }}</el-tag></template></el-table-column>
+                    <el-table-column label="操作" width="180" fixed="right">
+                        <template #default="scope">
+                            <el-button size="small" type="primary" link @click="openModelDialog(scope.row)">编辑</el-button>
+                            <el-button size="small" type="success" link @click="cloneModel(scope.row)">复制</el-button>
+                        </template>
+                    </el-table-column>
+                </el-table>
             </div>
 
-            
-            <div class="main-content">
-<!-- 1. 模型与映射 -->
-<div v-if="activeTab === 'models'">
-    <div style="margin-bottom: 20px;">
-        <el-button type="primary" @click="openModelDialog()">新增模型映射</el-button>
-    </div>
-    <el-table :data="models" border style="width: 100%">
-        <el-table-column prop="id" label="ID" width="60"></el-table-column>
-        <el-table-column prop="model_name" label="下游模型名" width="180"></el-table-column>
-        <el-table-column prop="channel_name" label="代理渠道" width="150"></el-table-column>
-        <el-table-column prop="route_path" label="上游路由"></el-table-column>
-        <el-table-column label="任务类型" width="100">
-            <template #default="scope">
-                <el-tag :type="scope.row.is_async ? 'warning' : 'success'">{{ scope.row.is_async ? '异步' : '同步' }}</el-tag>
-            </template>
-        </el-table-column>
-        <el-table-column label="操作" width="220" fixed="right">
-            <template #default="scope">
-                <el-button size="small" type="primary" link @click="openModelDialog(scope.row)">编辑</el-button>
-                <el-button size="small" type="success" link @click="cloneModel(scope.row)">复制</el-button>
-            </template>
-        </el-table-column>
-    </el-table>
-</div>
-<!-- 2. 上游渠道管理 -->
-<div v-if="activeTab === 'channels'">
-    <div style="margin-bottom: 20px;">
-        <el-button type="primary" @click="openChannelDialog()">新增上游渠道</el-button>
-    </div>
-    <el-table :data="channels" border style="width: 100%">
-        <el-table-column prop="id" label="ID" width="60"></el-table-column>
-        <el-table-column prop="name" label="渠道名称" width="200"></el-table-column>
-        <el-table-column prop="base_url" label="Base URL"></el-table-column>
-        <el-table-column prop="api_key" label="默认密钥">
-            <template #default="scope">
-                {{ scope.row.api_key ? '已设置' : '未设置' }}
-            </template>
-        </el-table-column>
-        <el-table-column label="操作" width="120" fixed="right">
-            <template #default="scope">
-                <el-button size="small" type="primary" link @click="openChannelDialog(scope.row)">编辑</el-button>
-            </template>
-        </el-table-column>
-    </el-table>
-</div>
-<!-- 3. 网关密钥分发 -->
-<div v-if="activeTab === 'keys'">
-    <div style="margin-bottom: 20px;">
-        <el-button type="primary" @click="openKeyDialog()">签发新 Key</el-button>
-    </div>
-    <el-table :data="keys" border style="width: 100%">
-        <el-table-column prop="id" label="ID" width="60"></el-table-column>
-        <el-table-column prop="api_key" label="网关 API Key" width="300"></el-table-column>
-        <el-table-column prop="quota" label="剩余额度 (次)"></el-table-column>
-        <el-table-column label="状态" width="100">
-            <template #default="scope">
-                <el-tag :type="scope.row.status ? 'success' : 'danger'">{{ scope.row.status ? '正常' : '已禁用' }}</el-tag>
-            </template>
-        </el-table-column>
-        <el-table-column label="操作" width="120" fixed="right">
-            <template #default="scope">
-                <el-button size="small" type="primary" link @click="openKeyDialog(scope.row)">编辑/充值</el-button>
-            </template>
-        </el-table-column>
-    </el-table>
-</div>
+            <div v-if="activeTab === 'channels'">
+                <div style="margin-bottom: 20px;"><el-button type="primary" @click="openChannelDialog()">新增上游渠道</el-button></div>
+                <el-table :data="channels" border style="width: 100%">
+                    <el-table-column prop="id" label="ID" width="60"></el-table-column>
+                    <el-table-column prop="name" label="渠道名称" width="200"></el-table-column>
+                    <el-table-column prop="base_url" label="Base URL"></el-table-column>
+                    <el-table-column label="默认密钥"><template #default="scope">{{ scope.row.api_key ? '已设置' : '未设置' }}</template></el-table-column>
+                    <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status ? 'success' : 'danger'">{{ scope.row.status ? '启用' : '禁用' }}</el-tag></template></el-table-column>
+                    <el-table-column label="操作" width="120" fixed="right"><template #default="scope"><el-button size="small" type="primary" link @click="openChannelDialog(scope.row)">编辑</el-button></template></el-table-column>
+                </el-table>
+            </div>
 
-                
-            <el-dialog :title="dialogForm.id ? `编辑模型映射` : `新增模型映射`" v-model="dialogVisible" width="900px" top="5vh">
-                <el-form :model="dialogForm" label-width="120px" label-position="top">
-                    
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px;">
-                        <el-form-item label="下游请求模型名 (必须唯一)">
-                            <el-input v-model="dialogForm.model_name" placeholder="例如: sora-mock"></el-input>
-                        </el-form-item>
-                        <el-form-item label="选择代理渠道">
-                            <el-select v-model="dialogForm.channel_id" placeholder="请选择" style="width: 100%;">
-                                <el-option v-for="c in channels" :key="c.id" :label="c.name" :value="c.id"></el-option>
-                            </el-select>
-                        </el-form-item>
-                        <el-form-item label="上游请求路由路径">
-                            <el-input v-model="dialogForm.route_path" placeholder="例如: /v1/videos"></el-input>
-                        </el-form-item>
-                        <el-form-item label="是否为异步任务">
-                            <el-switch v-model="dialogForm.is_async" :active-value="1" :inactive-value="0" active-text="异步生成(如视频)" inactive-text="同步生成(如图片)"></el-switch>
-                        </el-form-item>
+            <div v-if="activeTab === 'keys'">
+                <div style="margin-bottom: 20px;"><el-button type="primary" @click="openKeyDialog()">签发新 Key</el-button></div>
+                <el-table :data="keys" border style="width: 100%">
+                    <el-table-column prop="id" label="ID" width="60"></el-table-column>
+                    <el-table-column prop="api_key" label="网关 API Key" width="300"></el-table-column>
+                    <el-table-column prop="quota" label="总额度"></el-table-column>
+                    <el-table-column prop="used_quota" label="已用额度"></el-table-column>
+                    <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status ? 'success' : 'danger'">{{ scope.row.status ? '正常' : '已禁用' }}</el-tag></template></el-table-column>
+                    <el-table-column label="操作" width="120" fixed="right"><template #default="scope"><el-button size="small" type="primary" link @click="openKeyDialog(scope.row)">编辑/充值</el-button></template></el-table-column>
+                </el-table>
+            </div>
+
+            <el-dialog :title="dialogForm.id ? '编辑逻辑模型' : '新增逻辑模型'" v-model="dialogVisible" width="1100px" top="3vh">
+                <el-form :model="dialogForm" label-position="top">
+                    <div style="display: grid; grid-template-columns: 1fr 200px; gap: 20px;">
+                        <el-form-item label="下游请求模型名"><el-input v-model="dialogForm.model_name" placeholder="例如: sora-video"></el-input></el-form-item>
+                        <el-form-item label="模型状态"><el-switch v-model="dialogForm.status" :active-value="1" :inactive-value="0" active-text="启用" inactive-text="禁用"></el-switch></el-form-item>
                     </div>
-                    
-                    <el-divider></el-divider>
-                    
-                    <el-form-item label="映射配置模式">
-                        <el-radio-group v-model="dialogForm.mode">
-                            <el-radio label="visual" border> 小白可视化填表模式</el-radio>
-                            <el-radio label="advanced" border> 专家级 JSONata 代码模式</el-radio>
-                        </el-radio-group>
-                    </el-form-item>
-                    
-                    
-                    <div v-if="dialogForm.mode === `visual`">
-                        <div class="visual-box">
-                            <h4><el-icon><icon-position></icon-position></el-icon> 1. 组装发送给上游的参数 (Request Mapping)</h4>
-                            <el-table :data="visualConfig.reqFields" border size="small" style="margin-bottom:10px;">
-                                <el-table-column label="上游期望的参数名" width="200">
-                                    <template #default="scope"><el-input v-model="scope.row.key" placeholder="上游字段名"></el-input></template>
-                                </el-table-column>
-                                <el-table-column label="数据怎么来？" width="150">
-                                    <template #default="scope">
-                                        <el-select v-model="scope.row.type">
-                                            <el-option label="提取下游传的值" value="downstream"></el-option>
-                                            <el-option label="使用固定文本" value="static_string"></el-option>
-                                            <el-option label="使用固定数字" value="static_number"></el-option>
-                                        </el-select>
-                                    </template>
-                                </el-table-column>
-                                <el-table-column label="对应的值">
-                                    <template #default="scope">
-                                        <el-input v-model="scope.row.value" :placeholder="scope.row.type === `downstream` ? `填下游字段` : `填固定值`"></el-input>
-                                    </template>
-                                </el-table-column>
-                                <el-table-column label="操作" width="80" align="center">
-                                    <template #default="scope"><el-button link type="danger" @click="visualConfig.reqFields.splice(scope.$index, 1)">删除</el-button></template>
-                                </el-table-column>
-                            </el-table>
-                            <el-button type="dashed" style="width:100%" @click="visualConfig.reqFields.push({key:``, type:`downstream`, value:``})">
-                                + 添加一个发送给上游的参数
-                            </el-button>
-                        </div>
-                        
-                        <div v-if="dialogForm.is_async === 1">
-                            <div class="visual-box">
-                                <h4><el-icon><icon-refreshright></icon-refreshright></el-icon> 2. 从上游返回结果中提取任务 ID</h4>
-                                <el-form-item label="任务ID存在哪个字段？">
-                                    <el-input v-model="visualConfig.respTaskId" placeholder="task_id"></el-input>
-                                </el-form-item>
-                            </div>
-
-                            <div class="visual-box" style="background:#fdf6ec; border-color:#faecd8;">
-                                <h4 style="color:#e6a23c;"><el-icon><icon-timer></icon-timer></el-icon> 3. 异步任务轮询提取配置</h4>
-                                <el-form-item label="上游用来查询进度的URL路径 (支持 ${up_task_id} 替换)">
-                                    <el-input v-model="dialogForm.poll_path" placeholder="例如: /v1/tasks/${up_task_id}"></el-input>
-                                </el-form-item>
-                                
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px;">
-                                    <el-form-item label="上游的状态在哪个字段？">
-                                        <el-input v-model="visualConfig.pollStatusField" placeholder="status"></el-input>
-                                    </el-form-item>
-                                    <el-form-item label="上游返回的媒体结果URL在哪个字段？">
-                                        <el-input v-model="visualConfig.pollUrlField" placeholder="例如 video_url 或 data.url"></el-input>
-                                    </el-form-item>
-                                </div>
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px;">
-                                    <el-form-item label="状态等于什么时算成功？">
-                                        <el-input v-model="visualConfig.pollSuccessVal" placeholder="例如 SUCCESS"></el-input>
-                                    </el-form-item>
-                                    <el-form-item label="状态等于什么时算失败(退费)？">
-                                        <el-input v-model="visualConfig.pollFailVal" placeholder="例如 FAILED"></el-input>
-                                    </el-form-item>
-                                </div>
+                    <el-divider content-position="left">渠道绑定</el-divider>
+                    <div v-for="(binding, index) in dialogForm.bindings" :key="binding.local_id" class="binding-card">
+                        <div class="binding-title">
+                            <strong>绑定 {{ index + 1 }}：{{ channelName(binding.channel_id) }}</strong>
+                            <div>
+                                <el-button size="small" @click="cloneBinding(index)">复制绑定</el-button>
+                                <el-button size="small" type="danger" @click="removeBinding(index)">删除/禁用</el-button>
                             </div>
                         </div>
-
-                        <div v-if="dialogForm.is_async === 0">
-                            <div class="visual-box" style="background:#f0f9eb; border-color:#e1f3d8;">
-                                <h4 style="color:#67c23a;"><el-icon><icon-check></icon-check></el-icon> 2. 组装返回给下游的结果 (Response Mapping)</h4>
-                                <el-form-item label="结果处理方式">
-                                    <el-radio-group v-model="visualConfig.syncRespMode">
-                                        <el-radio label="passthrough">直接透传完整结果</el-radio>
-                                        <el-radio label="custom">自定义提取与组装字段</el-radio>
-                                    </el-radio-group>
-                                </el-form-item>
-                                <div v-if="visualConfig.syncRespMode === `custom`">
-                                    <el-table :data="visualConfig.respFields" border size="small" style="margin-bottom:10px;">
-                                        <el-table-column label="下游的字段名" width="200">
-                                            <template #default="scope"><el-input v-model="scope.row.key" placeholder="下游字段名"></el-input></template>
-                                        </el-table-column>
-                                        <el-table-column label="数据怎么来？" width="150">
-                                            <template #default="scope">
-                                                <el-select v-model="scope.row.type">
-                                                    <el-option label="提取上游返回" value="upstream"></el-option>
-                                                    <el-option label="使用固定文本" value="static_string"></el-option>
-                                                    <el-option label="使用固定数字" value="static_number"></el-option>
-                                                </el-select>
-                                            </template>
-                                        </el-table-column>
-                                        <el-table-column label="对应的值">
-                                            <template #default="scope">
-                                                <el-input v-model="scope.row.value" :placeholder="scope.row.type === `upstream` ? `填上游路径` : `填固定值`"></el-input>
-                                            </template>
-                                        </el-table-column>
-                                        <el-table-column label="操作" width="80" align="center">
-                                            <template #default="scope"><el-button link type="danger" @click="visualConfig.respFields.splice(scope.$index, 1)">删除</el-button></template>
-                                        </el-table-column>
-                                    </el-table>
-                                    <el-button type="dashed" style="width:100%" @click="visualConfig.respFields.push({key:``, type:`upstream`, value:``})">
-                                        + 添加返回给下游的参数
-                                    </el-button>
-                                </div>
-                            </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr 120px 120px; gap: 0 16px;">
+                            <el-form-item label="选择渠道"><el-select v-model="binding.channel_id" style="width:100%"><el-option v-for="c in channels" :key="c.id" :label="c.name" :value="c.id"></el-option></el-select></el-form-item>
+                            <el-form-item label="上游请求路由"><el-input v-model="binding.route_path" placeholder="/v1/videos"></el-input></el-form-item>
+                            <el-form-item label="权重"><el-input-number v-model="binding.weight" :min="1" style="width:100%"></el-input-number></el-form-item>
+                            <el-form-item label="启用"><el-switch v-model="binding.status" :active-value="1" :inactive-value="0"></el-switch></el-form-item>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px;">
+                            <el-form-item label="任务类型"><el-switch v-model="binding.is_async" :active-value="1" :inactive-value="0" active-text="异步" inactive-text="同步"></el-switch></el-form-item>
+                            <el-form-item label="绑定级 API Key（为空则使用渠道默认密钥）"><el-input v-model="binding.api_key" show-password></el-input></el-form-item>
+                        </div>
+                        <el-form-item label="请求报文映射规则 (JSONata)" class="mono"><el-input type="textarea" :rows="5" v-model="binding.req_mapping"></el-input></el-form-item>
+                        <el-form-item label="响应报文映射规则 (JSONata)" class="mono"><el-input type="textarea" :rows="4" v-model="binding.resp_mapping"></el-input></el-form-item>
+                        <div v-if="binding.is_async === 1">
+                            <el-form-item label="轮询路由路径 (支持 ${up_task_id})"><el-input v-model="binding.poll_path"></el-input></el-form-item>
+                            <el-form-item label="轮询响应提取规则 (JSONata)" class="mono"><el-input type="textarea" :rows="4" v-model="binding.poll_mapping"></el-input></el-form-item>
                         </div>
                     </div>
-                    
-                    
-                    <div v-else>
-                        <el-alert title="您可以直接编写 JSONata 代码。如果从小白模式切过来，自动生成的代码会更新在这里。" type="warning" show-icon style="margin-bottom:15px;"></el-alert>
-                        <el-form-item label="请求报文映射规则 (JSONata)">
-                            <el-input type="textarea" :rows="5" v-model="dialogForm.req_mapping" style="font-family: monospace;"></el-input>
-                        </el-form-item>
-                        <el-form-item label="响应报文映射规则 (JSONata)">
-                            <el-input type="textarea" :rows="3" v-model="dialogForm.resp_mapping" style="font-family: monospace;"></el-input>
-                        </el-form-item>
-                        
-                        <div v-if="dialogForm.is_async === 1" style="margin-top:20px;">
-                            <el-form-item label="轮询路由路径 (支持 ${up_task_id} 变量)">
-                                <el-input v-model="dialogForm.poll_path"></el-input>
-                            </el-form-item>
-                            <el-form-item label="轮询响应提取规则 (JSONata)">
-                                <el-input type="textarea" :rows="4" v-model="dialogForm.poll_mapping" style="font-family: monospace;"></el-input>
-                            </el-form-item>
-                        </div>
-                    </div>
+                    <el-button style="width:100%;" @click="addBinding">+ 添加渠道绑定</el-button>
                 </el-form>
                 <template #footer>
-                    <el-button @click="dialogVisible = false">取 消</el-button>
-                    <el-button type="primary" @click="saveModel">确认保存</el-button>
+                    <el-button @click="dialogVisible = false">取消</el-button>
+                    <el-button type="primary" @click="saveModel">保存</el-button>
                 </template>
             </el-dialog>
 
-            
-            <el-dialog :title="channelForm.id ? `编辑渠道` : `新增渠道`" v-model="channelDialogVisible" width="500px">
-                <el-form :model="channelForm" label-width="120px" label-position="top">
-                    <el-form-item label="渠道名称 (用于备注)">
-                        <el-input v-model="channelForm.name" placeholder="例如：百度智能云"></el-input>
-                    </el-form-item>
-                    <el-form-item label="上游 BaseURL">
-                        <el-input v-model="channelForm.base_url" placeholder="例如：https://aip.baidubce.com"></el-input>
-                    </el-form-item>
-                    <el-form-item label="渠道默认密钥 (API Key)">
-                        <el-input v-model="channelForm.api_key" placeholder="如果没有可留空"></el-input>
-                    </el-form-item>
+            <el-dialog :title="channelForm.id ? '编辑渠道' : '新增渠道'" v-model="channelDialogVisible" width="500px">
+                <el-form :model="channelForm" label-position="top">
+                    <el-form-item label="渠道名称"><el-input v-model="channelForm.name"></el-input></el-form-item>
+                    <el-form-item label="上游 BaseURL"><el-input v-model="channelForm.base_url"></el-input></el-form-item>
+                    <el-form-item label="渠道默认密钥"><el-input v-model="channelForm.api_key" show-password></el-input></el-form-item>
+                    <el-form-item label="是否启用"><el-switch v-model="channelForm.status" :active-value="1" :inactive-value="0"></el-switch></el-form-item>
                 </el-form>
-                <template #footer>
-                    <el-button @click="channelDialogVisible = false">取消</el-button>
-                    <el-button type="primary" @click="saveChannel">保存渠道</el-button>
-                </template>
+                <template #footer><el-button @click="channelDialogVisible = false">取消</el-button><el-button type="primary" @click="saveChannel">保存渠道</el-button></template>
             </el-dialog>
 
-            
-            <el-dialog :title="keyForm.id ? `编辑 Key / 充值` : `签发新 Key`" v-model="keyDialogVisible" width="500px">
-                <el-form :model="keyForm" label-width="120px" label-position="top">
-                    <el-form-item label="网关 API Key (分发给下游客户的凭证)">
-                        <el-input v-model="keyForm.api_key" :disabled="!!keyForm.id">
-                            <template #append v-if="!keyForm.id"><el-button @click="generateKeyString">随机生成</el-button></template>
-                        </el-input>
-                    </el-form-item>
-                    <el-form-item label="分配总额度 (调用次数)">
-                        <el-input-number v-model="keyForm.quota" :min="0" :step="1000" style="width: 100%;"></el-input-number>
-                    </el-form-item>
-                    <el-form-item label="是否启用">
-                        <el-switch v-model="keyForm.status" :active-value="1" :inactive-value="0"></el-switch>
-                    </el-form-item>
+            <el-dialog :title="keyForm.id ? '编辑 Key / 充值' : '签发新 Key'" v-model="keyDialogVisible" width="500px">
+                <el-form :model="keyForm" label-position="top">
+                    <el-form-item label="网关 API Key"><el-input v-model="keyForm.api_key" :disabled="!!keyForm.id"><template #append v-if="!keyForm.id"><el-button @click="generateKeyString">随机生成</el-button></template></el-input></el-form-item>
+                    <el-form-item label="分配总额度"><el-input-number v-model="keyForm.quota" :min="0" :step="1000" style="width: 100%;"></el-input-number></el-form-item>
+                    <el-form-item label="是否启用"><el-switch v-model="keyForm.status" :active-value="1" :inactive-value="0"></el-switch></el-form-item>
                 </el-form>
-                <template #footer>
-                    <el-button @click="keyDialogVisible = false">取消</el-button>
-                    <el-button type="primary" @click="saveKey">保存配置</el-button>
-                </template>
+                <template #footer><el-button @click="keyDialogVisible = false">取消</el-button><el-button type="primary" @click="saveKey">保存配置</el-button></template>
             </el-dialog>
-
         </div>
     </div>
-    
-    <script>
-        const { createApp, ref, reactive, onMounted, watch } = Vue;
-        
-        
-        const app = createApp({
-            setup() {
-                const isLoggedIn = ref(false);
-                const activeTab = ref("models");
-                const loading = ref(false);
-                const loginForm = reactive({ username: "admin", password: "" });
-                const token = ref(localStorage.getItem("admin_token") || "");
-                
-                const models = ref([]);
-                const channels = ref([]);
-                const keys = ref([]);
-                
-                const dialogVisible = ref(false);
-                const dialogForm = ref({});
-                const visualConfig = ref({
-                    reqFields: [{key: "prompt", type: "downstream", value: "prompt"}],
-                    respTaskId: "task_id",
-                    pollStatusField: "status",
-                    pollUrlField: "video_url",
-                    pollSuccessVal: "SUCCESS",
-                    pollFailVal: "FAILED",
-                    syncRespMode: "passthrough",
-                    respFields: [{key: "image_url", type: "upstream", value: "data.url"}]
+</div>
+
+<script>
+const { createApp, ref, reactive } = Vue;
+
+const app = createApp({
+    setup() {
+        const isLoggedIn = ref(false);
+        const activeTab = ref("models");
+        const loading = ref(false);
+        const loginForm = reactive({ username: "admin", password: "" });
+        const token = ref(localStorage.getItem("admin_token") || "");
+        const models = ref([]);
+        const channels = ref([]);
+        const keys = ref([]);
+        const dialogVisible = ref(false);
+        const dialogForm = ref({});
+        const channelDialogVisible = ref(false);
+        const channelForm = ref({});
+        const keyDialogVisible = ref(false);
+        const keyForm = ref({});
+
+        if (token.value) { isLoggedIn.value = true; fetchData(); }
+
+        async function requestApi(path, method = "GET", body = null) {
+            try {
+                const res = await fetch(`/admin${path}`, {
+                    method,
+                    headers: { "Authorization": `Bearer ${token.value}`, "Content-Type": "application/json" },
+                    body: body ? JSON.stringify(body) : null
                 });
-
-                const channelDialogVisible = ref(false);
-                const channelForm = ref({});
-
-                const keyDialogVisible = ref(false);
-                const keyForm = ref({});
-                
-                if (token.value) { isLoggedIn.value = true; fetchData(); }
-
-                async function requestApi(path, method = "GET", body = null) {
-                    try {
-                        const res = await fetch(`/admin${path}`, {
-                            method,
-                            headers: { "Authorization": `Bearer ${token.value}`, "Content-Type": "application/json" },
-                            body: body ? JSON.stringify(body) : null
-                        });
-                        const data = await res.json();
-                        if(res.status === 401) { ElementPlus.ElMessage.warning("会话已过期，请重新登录"); logout(); return null; }
-                        if(res.status !== 200) { ElementPlus.ElMessage.error(data.error || "请求失败"); return null; }
-                        return data;
-                    } catch (e) { ElementPlus.ElMessage.error("网络请求异常"); return null; }
-                }
-
-                async function login() {
-                    if (!loginForm.username || !loginForm.password) return ElementPlus.ElMessage.warning("请输入账号和密码");
-                    loading.value = true;
-                    try {
-                        const res = await fetch("/admin/login", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify(loginForm)
-                        });
-                        const data = await res.json();
-                        if (data.success) {
-                            token.value = data.token;
-                            localStorage.setItem("admin_token", data.token);
-                            isLoggedIn.value = true;
-                            fetchData();
-                            ElementPlus.ElMessage.success("登录成功");
-                        } else {
-                            ElementPlus.ElMessage.error(data.error || "账号或密码错误");
-                        }
-                    } catch (e) { ElementPlus.ElMessage.error("网络连接失败"); } 
-                    finally { loading.value = false; }
-                }
-                
-                function logout() { localStorage.removeItem("admin_token"); isLoggedIn.value = false; token.value = ""; }
-                function handleSelect(index) { activeTab.value = index; }
-
-                async function fetchData() {
-                    const m = await requestApi("/models"); if (m) models.value = m;
-                    const c = await requestApi("/channels"); if (c) channels.value = c;
-                    const k = await requestApi("/keys"); if (k) keys.value = k;
-                }
-                
-                function openModelDialog(row = null) {
-                    if(row) {
-                        dialogForm.value = JSON.parse(JSON.stringify(row));
-                        const match = dialogForm.value.req_mapping.match(/\/\* VISUAL_CONFIG: (.*?) \*\//);
-                        if (match) {
-                            dialogForm.value.mode = "visual";
-                            visualConfig.value = JSON.parse(match[1]);
-                            dialogForm.value.req_mapping = dialogForm.value.req_mapping.replace(/\/\* VISUAL_CONFIG: .*? \*\/\n/, "");
-                        } else { dialogForm.value.mode = "advanced"; }
-                    } else {
-                        dialogForm.value = { is_async: 0, weight: 1, mode: "visual", channel_id: channels.value.length > 0 ? channels.value[0].id : null, req_mapping: "{\n  \n}", resp_mapping: "{\n  \n}", poll_mapping: "{\n  \n}" };
-                        visualConfig.value = { reqFields: [{key: "model", type: "downstream", value: "model"}, {key: "prompt", type: "downstream", value: "prompt"}], respTaskId: "task_id", pollStatusField: "status", pollUrlField: "video_url", pollSuccessVal: "completed", pollFailVal: "failed", syncRespMode: "passthrough", respFields: [{key: "image_url", type: "upstream", value: "data.url"}] };
-                    }
-                    dialogVisible.value = true;
-                }
-                
-                function cloneModel(row) {
-                    openModelDialog(row);
-                    delete dialogForm.value.id; 
-                    dialogForm.value.model_name = dialogForm.value.model_name + "_copy";
-                    ElementPlus.ElMessage.info("已复制模型配置");
-                }
-                
-                function compileVisualToJSONata() {
-                    let reqLines = visualConfig.value.reqFields.filter(f => f.key).map(f => {
-                        let val = f.value;
-                        if(f.type === "static_string") val = `"${val}"`;
-                        else if(f.type === "static_number") val = Number(val);
-                        return `  "${f.key}": ${val}`;
-                    });
-                    
-                    const meta = `/* VISUAL_CONFIG: ${JSON.stringify(visualConfig.value)} */\n`;
-                    dialogForm.value.req_mapping = meta + `{\n${reqLines.join(",\n")}\n}`;
-                    
-                    if (dialogForm.value.is_async === 1) {
-                        const taskIdPath = visualConfig.value.respTaskId || "task_id";
-                        dialogForm.value.resp_mapping = `{\n  "task_id": ${taskIdPath},\n  "status": "queued"\n}`;
-                        
-                        const sPath = visualConfig.value.pollStatusField || "status";
-                        const uPath = visualConfig.value.pollUrlField || "video_url";
-                        const sVal = visualConfig.value.pollSuccessVal || "completed";
-                        const fVal = visualConfig.value.pollFailVal || "failed";
-                        dialogForm.value.poll_mapping = "{\n  \"status\": " + sPath + " = '" + sVal + "' ? 'completed' : (" + sPath + " = '" + fVal + "' ? 'failed' : 'processing'),\n  \"video_url\": " + uPath + "\n}";
-                    } else {
-                        if (visualConfig.value.syncRespMode === "passthrough") {
-                            dialogForm.value.resp_mapping = "$";
-                        } else {
-                            let respLines = visualConfig.value.respFields.filter(f => f.key).map(f => {
-                                let val = f.value;
-                                if(f.type === "static_string") val = `"${val}"`;
-                                else if(f.type === "static_number") val = Number(val);
-                                return `  "${f.key}": ${val}`;
-                            });
-                            dialogForm.value.resp_mapping = `{\n${respLines.join(",\n")}\n}`;
-                        }
-                        dialogForm.value.poll_mapping = "{}";
-                    }
-                }
-
-                async function saveModel() {
-                    if (!dialogForm.value.model_name || !dialogForm.value.channel_id) return ElementPlus.ElMessage.warning("请填写模型名和渠道");
-                    if (dialogForm.value.mode === "visual") compileVisualToJSONata();
-                    const method = dialogForm.value.id ? "PUT" : "POST";
-                    const path = dialogForm.value.id ? `/models/${dialogForm.value.id}` : "/models";
-                    const res = await requestApi(path, method, dialogForm.value);
-                    if(res && res.success) { ElementPlus.ElMessage.success("保存成功"); dialogVisible.value = false; fetchData(); }
-                }
-
-                function openChannelDialog(row = null) { channelForm.value = row ? JSON.parse(JSON.stringify(row)) : { status: 1 }; channelDialogVisible.value = true; }
-                async function saveChannel() {
-                    if (!channelForm.value.name || !channelForm.value.base_url) return ElementPlus.ElMessage.warning("名称和URL不能为空");
-                    const method = channelForm.value.id ? "PUT" : "POST";
-                    const path = channelForm.value.id ? `/channels/${channelForm.value.id}` : "/channels";
-                    const res = await requestApi(path, method, channelForm.value);
-                    if(res && res.success) { ElementPlus.ElMessage.success("保存成功"); channelDialogVisible.value = false; fetchData(); }
-                }
-
-                function generateKeyString() { keyForm.value.api_key = "sk-" + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15); }
-                function openKeyDialog(row = null) {
-                    if (row) { keyForm.value = JSON.parse(JSON.stringify(row)); } else { keyForm.value = { quota: 10000, status: 1 }; generateKeyString(); }
-                    keyDialogVisible.value = true;
-                }
-                async function saveKey() {
-                    if (!keyForm.value.api_key) return ElementPlus.ElMessage.warning("API Key不能为空");
-                    const method = keyForm.value.id ? "PUT" : "POST";
-                    const path = keyForm.value.id ? `/keys/${keyForm.value.id}` : "/keys";
-                    const res = await requestApi(path, method, keyForm.value);
-                    if(res && res.success) { ElementPlus.ElMessage.success("保存成功"); keyDialogVisible.value = false; fetchData(); }
-                }
-
-                return {
-                    isLoggedIn, activeTab, loading, loginForm, login, logout, handleSelect,
-                    models, channels, keys,
-                    dialogVisible, dialogForm, visualConfig, openModelDialog, saveModel, cloneModel,
-                    channelDialogVisible, channelForm, openChannelDialog, saveChannel,
-                    keyDialogVisible, keyForm, openKeyDialog, saveKey, generateKeyString
-                }
-            }
-        });
-        
-        if (typeof ElementPlusIconsVue !== "undefined") {
-            for (const [key, component] of Object.entries(ElementPlusIconsVue)) { app.component('icon-' + key.toLowerCase(), component);
-                app.component(key, component);
-            }
+                const data = await res.json();
+                if (res.status === 401) { ElementPlus.ElMessage.warning("会话已过期，请重新登录"); logout(); return null; }
+                if (res.status !== 200) { ElementPlus.ElMessage.error(data.error || "请求失败"); return null; }
+                return data;
+            } catch (e) { ElementPlus.ElMessage.error("网络请求异常"); return null; }
         }
-        
-        app.use(ElementPlus, { zIndex: 3000 });
-        app.mount("#app");
-    </script>
+
+        async function login() {
+            if (!loginForm.username || !loginForm.password) return ElementPlus.ElMessage.warning("请输入账号和密码");
+            loading.value = true;
+            try {
+                const res = await fetch("/admin/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(loginForm) });
+                const data = await res.json();
+                if (data.success) {
+                    token.value = data.token;
+                    localStorage.setItem("admin_token", data.token);
+                    isLoggedIn.value = true;
+                    await fetchData();
+                    ElementPlus.ElMessage.success("登录成功");
+                } else { ElementPlus.ElMessage.error(data.error || "账号或密码错误"); }
+            } catch (e) { ElementPlus.ElMessage.error("网络连接失败"); }
+            finally { loading.value = false; }
+        }
+
+        function logout() { localStorage.removeItem("admin_token"); isLoggedIn.value = false; token.value = ""; }
+        function handleSelect(index) { activeTab.value = index; }
+        async function fetchData() {
+            const m = await requestApi("/models"); if (m) models.value = m;
+            const c = await requestApi("/channels"); if (c) channels.value = c;
+            const k = await requestApi("/keys"); if (k) keys.value = k;
+        }
+
+        function defaultBinding() {
+            return {
+                local_id: Math.random().toString(36).slice(2),
+                channel_id: channels.value.length > 0 ? channels.value[0].id : null,
+                route_path: "/v1/videos",
+                poll_path: "/v1/videos/${up_task_id}",
+                api_key: "",
+                is_async: 1,
+                req_mapping: "{\n  \"model\": model,\n  \"prompt\": prompt\n}",
+                resp_mapping: "{\n  \"task_id\": id,\n  \"status\": status\n}",
+                poll_mapping: "{\n  \"status\": status,\n  \"progress\": progress,\n  \"video_url\": video_url\n}",
+                weight: 1,
+                status: 1
+            };
+        }
+
+        function normalizeBinding(binding) {
+            return { ...defaultBinding(), ...binding, local_id: Math.random().toString(36).slice(2) };
+        }
+
+        function openModelDialog(row = null) {
+            if (row) {
+                dialogForm.value = JSON.parse(JSON.stringify(row));
+                dialogForm.value.bindings = (dialogForm.value.bindings || []).map(normalizeBinding);
+            } else {
+                dialogForm.value = { model_name: "", status: 1, bindings: [defaultBinding()] };
+            }
+            dialogVisible.value = true;
+        }
+
+        function cloneModel(row) {
+            openModelDialog(row);
+            delete dialogForm.value.id;
+            dialogForm.value.model_name = `${dialogForm.value.model_name}_copy`;
+            dialogForm.value.bindings.forEach(binding => delete binding.id);
+            ElementPlus.ElMessage.info("已复制模型配置");
+        }
+
+        function addBinding() { dialogForm.value.bindings.push(defaultBinding()); }
+        function cloneBinding(index) {
+            const copy = JSON.parse(JSON.stringify(dialogForm.value.bindings[index]));
+            delete copy.id;
+            copy.local_id = Math.random().toString(36).slice(2);
+            dialogForm.value.bindings.splice(index + 1, 0, copy);
+        }
+        function removeBinding(index) {
+            const binding = dialogForm.value.bindings[index];
+            if (binding.id) binding.status = 0;
+            else dialogForm.value.bindings.splice(index, 1);
+        }
+        function channelName(channelId) {
+            const channel = channels.value.find(item => item.id === channelId);
+            return channel ? channel.name : "未选择渠道";
+        }
+
+        async function saveModel() {
+            if (!dialogForm.value.model_name) return ElementPlus.ElMessage.warning("请填写模型名");
+            if (!dialogForm.value.bindings || dialogForm.value.bindings.length === 0) return ElementPlus.ElMessage.warning("请至少配置一个渠道绑定");
+            for (const binding of dialogForm.value.bindings) {
+                if (!binding.channel_id || !binding.route_path) return ElementPlus.ElMessage.warning("每个绑定都需要渠道和路由");
+            }
+            const method = dialogForm.value.id ? "PUT" : "POST";
+            const path = dialogForm.value.id ? `/models/${dialogForm.value.id}` : "/models";
+            const res = await requestApi(path, method, dialogForm.value);
+            if (res && res.success) { ElementPlus.ElMessage.success("保存成功"); dialogVisible.value = false; fetchData(); }
+        }
+
+        function openChannelDialog(row = null) { channelForm.value = row ? JSON.parse(JSON.stringify(row)) : { status: 1 }; channelDialogVisible.value = true; }
+        async function saveChannel() {
+            if (!channelForm.value.name || !channelForm.value.base_url) return ElementPlus.ElMessage.warning("名称和URL不能为空");
+            const method = channelForm.value.id ? "PUT" : "POST";
+            const path = channelForm.value.id ? `/channels/${channelForm.value.id}` : "/channels";
+            const res = await requestApi(path, method, channelForm.value);
+            if (res && res.success) { ElementPlus.ElMessage.success("保存成功"); channelDialogVisible.value = false; fetchData(); }
+        }
+
+        function generateKeyString() { keyForm.value.api_key = "sk-" + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15); }
+        function openKeyDialog(row = null) {
+            keyForm.value = row ? JSON.parse(JSON.stringify(row)) : { quota: 10000, status: 1 };
+            if (!row) generateKeyString();
+            keyDialogVisible.value = true;
+        }
+        async function saveKey() {
+            if (!keyForm.value.api_key) return ElementPlus.ElMessage.warning("API Key不能为空");
+            const method = keyForm.value.id ? "PUT" : "POST";
+            const path = keyForm.value.id ? `/keys/${keyForm.value.id}` : "/keys";
+            const res = await requestApi(path, method, keyForm.value);
+            if (res && res.success) { ElementPlus.ElMessage.success("保存成功"); keyDialogVisible.value = false; fetchData(); }
+        }
+
+        return {
+            isLoggedIn, activeTab, loading, loginForm, login, logout, handleSelect,
+            models, channels, keys, dialogVisible, dialogForm, openModelDialog, saveModel, cloneModel,
+            addBinding, cloneBinding, removeBinding, channelName,
+            channelDialogVisible, channelForm, openChannelDialog, saveChannel,
+            keyDialogVisible, keyForm, openKeyDialog, saveKey, generateKeyString
+        };
+    }
+});
+
+if (typeof ElementPlusIconsVue !== "undefined") {
+    for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+        app.component('icon-' + key.toLowerCase(), component);
+        app.component(key, component);
+    }
+}
+app.use(ElementPlus, { zIndex: 3000 });
+app.mount("#app");
+</script>
 </body>
 </html>

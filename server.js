@@ -4,6 +4,7 @@ const FormData = require("form-data");
 const jsonata = require("jsonata");
 const morgan = require("morgan");
 const path = require("path");
+const crypto = require("crypto");
 const db = require("./db");
 
 const app = express();
@@ -278,7 +279,7 @@ async function buildMultipartRequest(payload) {
 }
 
 async function buildPostOptions(upstreamKey, upstreamPayload) {
-    const headers = { "Authorization": `Bearer ${upstreamKey}` };
+    const headers = upstreamKey ? { "Authorization": `Bearer ${upstreamKey}` } : {};
     if (!isMultipartPayload(upstreamPayload)) {
         return { data: stripGatewayMeta(upstreamPayload), options: { headers } };
     }
@@ -294,177 +295,219 @@ async function buildPostOptions(upstreamKey, upstreamPayload) {
     };
 }
 
+async function loadActiveBindings(modelName) {
+    return db.all(`SELECT
+            b.*,
+            b.id AS binding_id,
+            lm.id AS logical_model_id,
+            lm.model_name,
+            c.base_url,
+            c.api_key AS channel_api_key,
+            c.name AS channel_name
+        FROM logical_models lm
+        JOIN model_bindings b ON b.logical_model_id = lm.id
+        JOIN channels c ON c.id = b.channel_id
+        WHERE lm.model_name = ?
+          AND lm.status = 1
+          AND b.status = 1
+          AND c.status = 1`, [modelName]);
+}
+
+function selectBinding(bindings) {
+    const totalWeight = bindings.reduce((sum, binding) => sum + Math.max(Number(binding.weight || 1), 1), 0);
+    let target = Math.random() * totalWeight;
+    for (const binding of bindings) {
+        target -= Math.max(Number(binding.weight || 1), 1);
+        if (target <= 0) {
+            return binding;
+        }
+    }
+    return bindings[0];
+}
+
+async function selectModelBinding(modelName) {
+    const bindings = await loadActiveBindings(modelName);
+    if (bindings.length === 0) {
+        return null;
+    }
+    return selectBinding(bindings);
+}
+
+async function sendMappedPost(binding, body, logLabel) {
+    const upstreamPayload = await executeMapping(binding.req_mapping, body);
+    const upstreamKey = binding.api_key || binding.channel_api_key;
+    const upstreamUrl = resolveUpstreamUrl(binding, upstreamPayload);
+
+    console.log(`[${logLabel}] Routing ${binding.model_name} to ${binding.channel_name}: ${upstreamUrl}`);
+    const postRequest = await buildPostOptions(upstreamKey, upstreamPayload);
+    const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
+    const gwResponse = await executeMapping(binding.resp_mapping, upstreamRes.data);
+
+    return { gwResponse, upstreamKey };
+}
+
+async function loadLegacyPollRuntime(taskRecord) {
+    const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?", [taskRecord.model_id]);
+    if (!modelRecord) {
+        return null;
+    }
+    return {
+        base_url: modelRecord.base_url,
+        poll_path: modelRecord.poll_path,
+        poll_mapping: modelRecord.poll_mapping,
+        upstream_key: modelRecord.api_key || modelRecord.channel_api_key
+    };
+}
+
+async function pollAsyncTask(taskRecord) {
+    const runtime = (taskRecord.binding_id || taskRecord.upstream_base_url || taskRecord.poll_path_snapshot || taskRecord.poll_mapping_snapshot || taskRecord.upstream_api_key_snapshot)
+        ? {
+            base_url: taskRecord.upstream_base_url,
+            poll_path: taskRecord.poll_path_snapshot,
+            poll_mapping: taskRecord.poll_mapping_snapshot,
+            upstream_key: taskRecord.upstream_api_key_snapshot
+        }
+        : await loadLegacyPollRuntime(taskRecord);
+
+    if (!runtime) {
+        throw new Error("Task binding not found");
+    }
+
+    let upPollPath = runtime.poll_path || "/";
+    upPollPath = upPollPath.replace("${up_task_id}", taskRecord.up_task_id);
+
+    const upstreamRes = await axios.get(runtime.base_url + upPollPath, {
+        headers: runtime.upstream_key ? { "Authorization": `Bearer ${runtime.upstream_key}` } : {}
+    });
+
+    const pollResult = await executeMapping(runtime.poll_mapping, upstreamRes.data);
+    pollResult.id = taskRecord.gw_task_id;
+    pollResult.task_id = taskRecord.gw_task_id;
+    return pollResult;
+}
+
+async function updateTaskStatus(taskRecord, pollResult) {
+    if (pollResult.status === "completed") {
+        await db.run("UPDATE async_tasks SET status = 'completed' WHERE gw_task_id = ? AND status <> 'completed'", [taskRecord.gw_task_id]);
+    } else if (pollResult.status === "failed") {
+        const result = await db.run("UPDATE async_tasks SET status = 'failed', quota_released = 1 WHERE gw_task_id = ? AND quota_released = 0", [taskRecord.gw_task_id]);
+        if (result.affectedRows > 0) {
+            await db.run("UPDATE gateway_keys SET used_quota = GREATEST(used_quota - 1, 0) WHERE id = ?", [taskRecord.gw_key_id]);
+        }
+    }
+}
+
 app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
-    const { model } = req.body;
     try {
-        const modelRecord = await db.get('SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.model_name = ? AND m.status = 1', [model]);
-        if (!modelRecord) {
-            return res.status(404).json({ error: 'Model not found or disabled' });
+        const binding = await selectModelBinding(req.body.model);
+        if (!binding) {
+            return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
 
-        const upstreamPayload = await executeMapping(modelRecord.req_mapping, req.body);
-        const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
-        const upstreamUrl = resolveUpstreamUrl(modelRecord, upstreamPayload);
-        
-        console.log('[Gateway POST completions] Routing to: ' + upstreamUrl);
-        
         await db.run('UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?', [req.gatewayKey.id]);
-
-        const postRequest = await buildPostOptions(upstreamKey, upstreamPayload);
-        const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
-
-        const gwResponse = await executeMapping(modelRecord.resp_mapping, upstreamRes.data);
-        res.json(gwResponse);
-    } catch (e) {
-        console.error('Upstream error:', e.response ? e.response.data : e.message);
-        res.status(500).json({ error: 'Upstream request failed', details: e.message });
+        const { gwResponse } = await sendMappedPost(binding, req.body, "Gateway POST completions");
+        return res.json(gwResponse);
+    } catch (error) {
+        console.error("[Gateway POST completions Error]", error.response ? error.response.data : error.message);
+        return res.status(500).json({ error: "Upstream request failed", details: error.message });
     }
 });
 
 app.post(["/v1/images/generations", "/v1/images/edits"], authMiddleware, async (req, res) => {
-    const { model } = req.body;
     try {
-        const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.model_name = ? AND m.status = 1", [model]);
-        if (!modelRecord) {
-            return res.status(404).json({ error: "Model not found or disabled" });
+        const binding = await selectModelBinding(req.body.model);
+        if (!binding) {
+            return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
 
-        const upstreamPayload = await executeMapping(modelRecord.req_mapping, req.body);
-        const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
-        const upstreamUrl = resolveUpstreamUrl(modelRecord, upstreamPayload);
-
-        console.log(`[Gateway POST images] Routing to: ${upstreamUrl}`);
-        const postRequest = await buildPostOptions(upstreamKey, upstreamPayload);
-        const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
-
+        const { gwResponse } = await sendMappedPost(binding, req.body, "Gateway POST images");
         await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
-
-        const gwResponse = await executeMapping(modelRecord.resp_mapping, upstreamRes.data);
         return res.json(gwResponse);
     } catch (error) {
         console.error("[Gateway POST Images Error]", error.response ? error.response.data : error.message);
-        res.status(500).json({ error: "Upstream request failed", details: error.message });
+        return res.status(500).json({ error: "Upstream request failed", details: error.message });
     }
 });
+
 app.post("/v1/videos", authMiddleware, async (req, res) => {
-    const { model } = req.body;
     try {
-        const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.model_name = ? AND m.status = 1", [model]);
-        if (!modelRecord) {
-            return res.status(404).json({ error: "Model not found or disabled" });
+        const binding = await selectModelBinding(req.body.model);
+        if (!binding) {
+            return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
 
-        const upstreamPayload = await executeMapping(modelRecord.req_mapping, req.body);
-        const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
-        const upstreamUrl = resolveUpstreamUrl(modelRecord, upstreamPayload);
-        
-        console.log(`[Gateway POST] Routing to: ${upstreamUrl}`);
-        const postRequest = await buildPostOptions(upstreamKey, upstreamPayload);
-        const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
-
-        const gwResponse = await executeMapping(modelRecord.resp_mapping, upstreamRes.data);
-        
-        if (modelRecord.is_async) {
-            const upTaskId = gwResponse.task_id;
-            if (!upTaskId) {
-                return res.status(502).json({ error: "Upstream task ID mapping is missing" });
-            }
-            const gwTaskId = upTaskId;
-
-            await db.run("INSERT INTO async_tasks (gw_task_id, up_task_id, gw_key_id, model_id) VALUES (?, ?, ?, ?)",
-                [gwTaskId, upTaskId, req.gatewayKey.id, modelRecord.id]);
-            
-            await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
-            
-            return res.json({
-                id: gwTaskId,
-                task_id: gwTaskId,
-                model: modelRecord.model_name,
-                status: "queued",
-                progress: 0,
-                created_at: Math.floor(Date.now() / 1000)
-            });
-        } else {
+        const { gwResponse, upstreamKey } = await sendMappedPost(binding, req.body, "Gateway POST videos");
+        if (!binding.is_async) {
             return res.json(gwResponse);
         }
+
+        const upTaskId = gwResponse.task_id;
+        if (!upTaskId) {
+            return res.status(502).json({ error: "Upstream task ID mapping is missing" });
+        }
+
+        const gwTaskId = crypto.randomUUID();
+        await db.run(`INSERT INTO async_tasks (
+                gw_task_id, up_task_id, gw_key_id, model_id, logical_model_id, binding_id, channel_id,
+                upstream_base_url, poll_path_snapshot, poll_mapping_snapshot, upstream_api_key_snapshot
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`, [
+            gwTaskId,
+            upTaskId,
+            req.gatewayKey.id,
+            binding.logical_model_id,
+            binding.binding_id,
+            binding.channel_id,
+            binding.base_url,
+            binding.poll_path,
+            binding.poll_mapping,
+            upstreamKey
+        ]);
+        await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
+
+        return res.json({
+            id: gwTaskId,
+            task_id: gwTaskId,
+            model: binding.model_name,
+            status: "queued",
+            progress: 0,
+            created_at: Math.floor(Date.now() / 1000)
+        });
     } catch (error) {
-        console.error("[Gateway POST Error]", error.message);
-        res.status(500).json({ error: "Upstream request failed" });
+        console.error("[Gateway POST videos Error]", error.response ? error.response.data : error.message);
+        return res.status(500).json({ error: "Upstream request failed" });
     }
 });
 
 app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
-    const { task_id } = req.params;
     try {
-        const taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [task_id]);
+        const taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [req.params.task_id]);
         if (!taskRecord) {
             return res.status(404).json({ error: "Task not found" });
         }
-        const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?", [taskRecord.model_id]);
 
-        let upPollPath = modelRecord.poll_path || "/";
-        upPollPath = upPollPath.replace("${up_task_id}", taskRecord.up_task_id);
-
-        const upstreamUrl = modelRecord.base_url + upPollPath;
-        const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
-
-        const upstreamRes = await axios.get(upstreamUrl, {
-            headers: { "Authorization": `Bearer ${upstreamKey}` }
-        });
-
-        const pollResult = await executeMapping(modelRecord.poll_mapping, upstreamRes.data);
-
-        pollResult.id = taskRecord.gw_task_id;
-        pollResult.task_id = taskRecord.gw_task_id;
-
-        if (pollResult.status === "completed") {
-            await db.run("UPDATE async_tasks SET status = 'completed' WHERE gw_task_id = ?", [task_id]);
-        }
-        else if (pollResult.status === "failed") {
-            await db.run("UPDATE async_tasks SET status = 'failed' WHERE gw_task_id = ?", [task_id]);
-            await db.run("UPDATE gateway_keys SET used_quota = used_quota - 1 WHERE id = ?", [taskRecord.gw_key_id]);
-        }
-
+        const pollResult = await pollAsyncTask(taskRecord);
+        await updateTaskStatus(taskRecord, pollResult);
         return res.json(pollResult);
     } catch (error) {
         console.error("[Gateway GET Error]", error.message);
-        res.status(500).json({ error: "Failed to poll upstream status" });
+        return res.status(500).json({ error: "Failed to poll upstream status" });
     }
 });
 
 app.get("/v1/videos/:task_id/content", authMiddleware, async (req, res) => {
-    const { task_id } = req.params;
     try {
-        const taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [task_id]);
+        const taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [req.params.task_id]);
         if (!taskRecord) {
             return res.status(404).json({ error: "Task not found" });
         }
-        const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?", [taskRecord.model_id]);
 
-        let upPollPath = modelRecord.poll_path || "/";
-        upPollPath = upPollPath.replace("${up_task_id}", taskRecord.up_task_id);
-
-        const upstreamUrl = modelRecord.base_url + upPollPath;
-        const upstreamKey = modelRecord.api_key || modelRecord.channel_api_key;
-
-        const upstreamRes = await axios.get(upstreamUrl, {
-            headers: { "Authorization": `Bearer ${upstreamKey}` }
-        });
-
-        const pollResult = await executeMapping(modelRecord.poll_mapping, upstreamRes.data);
-        const videoUrl = pollResult && pollResult.status === "completed" ? (pollResult.video_url || "") : "";
-
-        if (pollResult.status === "completed") {
-            await db.run("UPDATE async_tasks SET status = 'completed' WHERE gw_task_id = ?", [task_id]);
-        } else if (pollResult.status === "failed") {
-            await db.run("UPDATE async_tasks SET status = 'failed' WHERE gw_task_id = ?", [task_id]);
-            await db.run("UPDATE gateway_keys SET used_quota = used_quota - 1 WHERE id = ?", [taskRecord.gw_key_id]);
-        }
-
-        return res.status(200).type("application/json").json({ url: videoUrl });
+        const pollResult = await pollAsyncTask(taskRecord);
+        await updateTaskStatus(taskRecord, pollResult);
+        const videoUrl = pollResult.status === "completed" ? (pollResult.video_url || "") : "";
+        return res.json({ url: videoUrl });
     } catch (error) {
         console.error("[Gateway GET Content Error]", error.message);
-        res.status(500).json({ error: "Failed to poll upstream status" });
+        return res.status(500).json({ error: "Failed to poll upstream status" });
     }
 });
 
@@ -472,6 +515,7 @@ const port = Number(process.env.PORT || 3000);
 
 async function start() {
     await db.waitForConnection();
+    await db.migrate();
     app.listen(port, () => {
         console.log(`AI Gateway MVP running on http://0.0.0.0:${port}`);
     });
