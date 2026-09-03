@@ -58,6 +58,7 @@
                                 <el-table-column prop="route_path" label="请求路由"></el-table-column>
                                 <el-table-column prop="weight" label="权重" width="80"></el-table-column>
                                 <el-table-column label="任务" width="90"><template #default="b"><el-tag :type="b.row.is_async ? 'warning' : 'success'">{{ b.row.is_async ? '异步' : '同步' }}</el-tag></template></el-table-column>
+                                <el-table-column label="视频内容" width="110"><template #default="b"><el-tag :type="b.row.proxy_content ? 'primary' : 'info'">{{ b.row.proxy_content ? '网关代理' : '返回直链' }}</el-tag></template></el-table-column>
                                 <el-table-column label="状态" width="100"><template #default="b"><el-tag :type="b.row.status && b.row.channel_status ? 'success' : 'danger'">{{ b.row.status && b.row.channel_status ? '可用' : '禁用' }}</el-tag></template></el-table-column>
                             </el-table>
                         </template>
@@ -120,8 +121,9 @@
                             <el-form-item label="权重"><el-input-number v-model="binding.weight" :min="1" style="width:100%"></el-input-number></el-form-item>
                             <el-form-item label="启用"><el-switch v-model="binding.status" :active-value="1" :inactive-value="0"></el-switch></el-form-item>
                         </div>
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px;">
+                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 16px;">
                             <el-form-item label="任务类型"><el-switch v-model="binding.is_async" :active-value="1" :inactive-value="0" active-text="异步" inactive-text="同步"></el-switch></el-form-item>
+                            <el-form-item label="视频内容访问"><el-switch v-model="binding.proxy_content" :active-value="1" :inactive-value="0" active-text="网关代理" inactive-text="返回直链"></el-switch></el-form-item>
                             <el-form-item label="绑定级 API Key（为空则使用渠道默认密钥）"><el-input v-model="binding.api_key" show-password></el-input></el-form-item>
                         </div>
                         <el-form-item label="请求报文映射规则 (JSONata)" class="mono"><el-input type="textarea" :rows="5" v-model="binding.req_mapping"></el-input></el-form-item>
@@ -230,6 +232,7 @@ const app = createApp({
                 poll_path: "/v1/videos/${up_task_id}",
                 api_key: "",
                 is_async: 1,
+                proxy_content: 0,
                 req_mapping: "{\n  \"model\": model,\n  \"prompt\": prompt\n}",
                 resp_mapping: "{\n  \"task_id\": id,\n  \"status\": status\n}",
                 poll_mapping: "{\n  \"status\": status,\n  \"progress\": progress,\n  \"video_url\": video_url\n}",

@@ -30,6 +30,7 @@ function normalizeBinding(binding) {
         poll_path: binding.poll_path || null,
         api_key: binding.api_key || null,
         is_async: binding.is_async ? 1 : 0,
+        proxy_content: binding.proxy_content ? 1 : 0,
         req_mapping: binding.req_mapping || "{}",
         resp_mapping: binding.resp_mapping || "{}",
         poll_mapping: binding.poll_mapping || "{}",
@@ -89,8 +90,8 @@ module.exports = function(db) {
             for (const binding of bindings || []) {
                 const item = normalizeBinding(binding);
                 await db.run(`INSERT INTO model_bindings
-                    (logical_model_id, channel_id, route_path, poll_path, api_key, is_async, req_mapping, resp_mapping, poll_mapping, weight, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [modelId, ...Object.values(item)]);
+                    (logical_model_id, channel_id, route_path, poll_path, api_key, is_async, proxy_content, req_mapping, resp_mapping, poll_mapping, weight, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [modelId, ...Object.values(item)]);
             }
             res.json({ success: true, id: modelId });
         } catch (e) { res.status(500).json({ error: e.message }); }
@@ -104,13 +105,13 @@ module.exports = function(db) {
                 for (const binding of bindings) {
                     const item = normalizeBinding(binding);
                     if (binding.id) {
-                        await db.run(`UPDATE model_bindings SET channel_id=?, route_path=?, poll_path=?, api_key=?, is_async=?,
+                        await db.run(`UPDATE model_bindings SET channel_id=?, route_path=?, poll_path=?, api_key=?, is_async=?, proxy_content=?,
                             req_mapping=?, resp_mapping=?, poll_mapping=?, weight=?, status=? WHERE id=? AND logical_model_id=?`,
                             [...Object.values(item), binding.id, req.params.id]);
                     } else {
                         await db.run(`INSERT INTO model_bindings
-                            (logical_model_id, channel_id, route_path, poll_path, api_key, is_async, req_mapping, resp_mapping, poll_mapping, weight, status)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [req.params.id, ...Object.values(item)]);
+                            (logical_model_id, channel_id, route_path, poll_path, api_key, is_async, proxy_content, req_mapping, resp_mapping, poll_mapping, weight, status)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [req.params.id, ...Object.values(item)]);
                     }
                 }
             }
@@ -127,8 +128,8 @@ module.exports = function(db) {
         try {
             const item = normalizeBinding(req.body);
             await db.run(`INSERT INTO model_bindings
-                (logical_model_id, channel_id, route_path, poll_path, api_key, is_async, req_mapping, resp_mapping, poll_mapping, weight, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [req.params.id, ...Object.values(item)]);
+                (logical_model_id, channel_id, route_path, poll_path, api_key, is_async, proxy_content, req_mapping, resp_mapping, poll_mapping, weight, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [req.params.id, ...Object.values(item)]);
             res.json({ success: true });
         } catch (e) { res.status(500).json({ error: e.message }); }
     });
@@ -136,7 +137,7 @@ module.exports = function(db) {
     router.put("/bindings/:id", adminAuth, async (req, res) => {
         try {
             const item = normalizeBinding(req.body);
-            await db.run(`UPDATE model_bindings SET channel_id=?, route_path=?, poll_path=?, api_key=?, is_async=?,
+            await db.run(`UPDATE model_bindings SET channel_id=?, route_path=?, poll_path=?, api_key=?, is_async=?, proxy_content=?,
                 req_mapping=?, resp_mapping=?, poll_mapping=?, weight=?, status=? WHERE id=?`, [...Object.values(item), req.params.id]);
             res.json({ success: true });
         } catch (e) { res.status(500).json({ error: e.message }); }

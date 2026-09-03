@@ -44,17 +44,25 @@ async function authMiddleware(req, res, next) {
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
         return res.status(401).json({ error: "Missing Authorization header" });
     }
-    const apiKey = authHeader.split(" ")[1];
-    
+    const apiKey = authHeader.slice("Bearer ".length).trim();
+    if (!apiKey) {
+        return res.status(401).json({ error: "Missing Authorization header" });
+    }
+
     try {
-        const keyRecord = await db.get("SELECT * FROM gateway_keys WHERE api_key = ? AND status = 1", [apiKey]);
-        if (!keyRecord) {
+        const keyRecord = await db.get("SELECT * FROM gateway_keys WHERE api_key = ?", [apiKey]);
+        if (keyRecord && keyRecord.status !== 1) {
             return res.status(401).json({ error: "Invalid or disabled API Key" });
         }
-        if (keyRecord.quota <= keyRecord.used_quota) {
-            return res.status(402).json({ error: "Insufficient quota" });
+        if (keyRecord) {
+            if (keyRecord.quota <= keyRecord.used_quota) {
+                return res.status(402).json({ error: "Insufficient quota" });
+            }
+            req.gatewayKey = keyRecord;
+            return next();
         }
-        req.gatewayKey = keyRecord;
+        req.gatewayKey = null;
+        req.passThroughKey = apiKey;
         next();
     } catch (error) {
         return res.status(500).json({ error: "Database error" });
@@ -73,6 +81,15 @@ async function executeMapping(mappingTemplate, data) {
 
 function isObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isHttpUrl(value) {
+    try {
+        const parsed = new URL(value);
+        return parsed.protocol === "http:" || parsed.protocol === "https:";
+    } catch (error) {
+        return false;
+    }
 }
 
 function getRequestFormat(payload) {
@@ -333,9 +350,9 @@ async function selectModelBinding(modelName) {
     return selectBinding(bindings);
 }
 
-async function sendMappedPost(binding, body, logLabel) {
+async function sendMappedPost(binding, body, logLabel, options = {}) {
     const upstreamPayload = await executeMapping(binding.req_mapping, body);
-    const upstreamKey = binding.api_key || binding.channel_api_key;
+    const upstreamKey = options.upstreamKey || binding.api_key || binding.channel_api_key;
     const upstreamUrl = resolveUpstreamUrl(binding, upstreamPayload);
 
     console.log(`[${logLabel}] Routing ${binding.model_name} to ${binding.channel_name}: ${upstreamUrl}`);
@@ -391,10 +408,103 @@ async function updateTaskStatus(taskRecord, pollResult) {
         await db.run("UPDATE async_tasks SET status = 'completed' WHERE gw_task_id = ? AND status <> 'completed'", [taskRecord.gw_task_id]);
     } else if (pollResult.status === "failed") {
         const result = await db.run("UPDATE async_tasks SET status = 'failed', quota_released = 1 WHERE gw_task_id = ? AND quota_released = 0", [taskRecord.gw_task_id]);
-        if (result.affectedRows > 0) {
+        if (result.affectedRows > 0 && taskRecord.gw_key_id) {
             await db.run("UPDATE gateway_keys SET used_quota = GREATEST(used_quota - 1, 0) WHERE id = ?", [taskRecord.gw_key_id]);
         }
     }
+}
+
+async function shouldProxyTaskContent(taskRecord) {
+    if (taskRecord.proxy_content_snapshot !== null && taskRecord.proxy_content_snapshot !== undefined) {
+        return Boolean(taskRecord.proxy_content_snapshot);
+    }
+    if (!taskRecord.binding_id) {
+        return false;
+    }
+    const binding = await db.get("SELECT proxy_content FROM model_bindings WHERE id = ?", [taskRecord.binding_id]);
+    return Boolean(binding && binding.proxy_content);
+}
+
+function getGatewayContentUrl(req, taskId) {
+    return req.protocol + "://" + req.get("host") + "/v1/videos/" + encodeURIComponent(taskId) + "/content";
+}
+
+function applyProxyContentUrl(req, taskRecord, pollResult) {
+    if (pollResult.status !== "completed") {
+        return;
+    }
+    const contentUrl = getGatewayContentUrl(req, taskRecord.gw_task_id);
+    pollResult.video_url = contentUrl;
+    pollResult.result_url = contentUrl;
+    if (typeof pollResult.object === "string" && isHttpUrl(pollResult.object)) {
+        pollResult.object = contentUrl;
+    }
+}
+
+async function proxyVideoContent(req, res, taskRecord, videoUrl) {
+    if (!isHttpUrl(videoUrl)) {
+        return res.status(502).json({ error: "Upstream video URL is missing or invalid" });
+    }
+
+    const headers = {};
+    if (taskRecord.upstream_api_key_snapshot) {
+        headers.Authorization = "Bearer " + taskRecord.upstream_api_key_snapshot;
+    }
+    if (req.headers.range) {
+        headers.Range = req.headers.range;
+    }
+    if (req.headers["if-range"]) {
+        headers["If-Range"] = req.headers["if-range"];
+    }
+
+    const upstreamRes = await axios.get(videoUrl, {
+        headers,
+        responseType: "stream",
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        timeout: Number(process.env.UPSTREAM_VIDEO_TIMEOUT_MS || 30000),
+        validateStatus: () => true
+    });
+
+    if (upstreamRes.status < 200 || upstreamRes.status >= 300) {
+        upstreamRes.data.resume();
+        console.error("[Gateway Video Proxy Upstream Error]", upstreamRes.status);
+        return res.status(502).json({
+            error: "Upstream video content request failed",
+            upstream_status: upstreamRes.status
+        });
+    }
+
+    [
+        "accept-ranges",
+        "cache-control",
+        "content-disposition",
+        "content-length",
+        "content-range",
+        "content-type",
+        "etag",
+        "last-modified"
+    ].forEach(name => {
+        if (upstreamRes.headers[name] !== undefined) {
+            res.setHeader(name, upstreamRes.headers[name]);
+        }
+    });
+    res.status(upstreamRes.status);
+
+    upstreamRes.data.on("error", error => {
+        console.error("[Gateway Video Stream Error]", error.message);
+        if (!res.headersSent) {
+            res.status(502).json({ error: "Upstream video stream failed" });
+        } else {
+            res.destroy(error);
+        }
+    });
+    res.on("close", () => {
+        if (!res.writableEnded && !upstreamRes.data.destroyed) {
+            upstreamRes.data.destroy();
+        }
+    });
+    upstreamRes.data.pipe(res);
 }
 
 app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
@@ -404,8 +514,12 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
             return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
 
-        await db.run('UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?', [req.gatewayKey.id]);
-        const { gwResponse } = await sendMappedPost(binding, req.body, "Gateway POST completions");
+        if (req.gatewayKey) {
+            await db.run('UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?', [req.gatewayKey.id]);
+        }
+        const { gwResponse } = await sendMappedPost(binding, req.body, "Gateway POST completions", {
+            upstreamKey: req.passThroughKey
+        });
         return res.json(gwResponse);
     } catch (error) {
         console.error("[Gateway POST completions Error]", error.response ? error.response.data : error.message);
@@ -420,8 +534,12 @@ app.post(["/v1/images/generations", "/v1/images/edits"], authMiddleware, async (
             return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
 
-        const { gwResponse } = await sendMappedPost(binding, req.body, "Gateway POST images");
-        await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
+        const { gwResponse } = await sendMappedPost(binding, req.body, "Gateway POST images", {
+            upstreamKey: req.passThroughKey
+        });
+        if (req.gatewayKey) {
+            await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
+        }
         return res.json(gwResponse);
     } catch (error) {
         console.error("[Gateway POST Images Error]", error.response ? error.response.data : error.message);
@@ -436,7 +554,9 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
             return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
 
-        const { gwResponse, upstreamKey } = await sendMappedPost(binding, req.body, "Gateway POST videos");
+        const { gwResponse, upstreamKey } = await sendMappedPost(binding, req.body, "Gateway POST videos", {
+            upstreamKey: req.passThroughKey
+        });
         if (!binding.is_async) {
             return res.json(gwResponse);
         }
@@ -449,20 +569,24 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
         const gwTaskId = crypto.randomUUID();
         await db.run(`INSERT INTO async_tasks (
                 gw_task_id, up_task_id, gw_key_id, model_id, logical_model_id, binding_id, channel_id,
-                upstream_base_url, poll_path_snapshot, poll_mapping_snapshot, upstream_api_key_snapshot
-            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`, [
+                upstream_base_url, poll_path_snapshot, poll_mapping_snapshot, upstream_api_key_snapshot,
+                proxy_content_snapshot
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             gwTaskId,
             upTaskId,
-            req.gatewayKey.id,
+            req.gatewayKey ? req.gatewayKey.id : null,
             binding.logical_model_id,
             binding.binding_id,
             binding.channel_id,
             binding.base_url,
             binding.poll_path,
             binding.poll_mapping,
-            upstreamKey
+            upstreamKey,
+            binding.proxy_content ? 1 : 0
         ]);
-        await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
+        if (req.gatewayKey) {
+            await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
+        }
 
         return res.json({
             id: gwTaskId,
@@ -487,6 +611,9 @@ app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
 
         const pollResult = await pollAsyncTask(taskRecord);
         await updateTaskStatus(taskRecord, pollResult);
+        if (await shouldProxyTaskContent(taskRecord)) {
+            applyProxyContentUrl(req, taskRecord, pollResult);
+        }
         return res.json(pollResult);
     } catch (error) {
         console.error("[Gateway GET Error]", error.message);
@@ -504,6 +631,9 @@ app.get("/v1/videos/:task_id/content", authMiddleware, async (req, res) => {
         const pollResult = await pollAsyncTask(taskRecord);
         await updateTaskStatus(taskRecord, pollResult);
         const videoUrl = pollResult.status === "completed" ? (pollResult.video_url || "") : "";
+        if (pollResult.status === "completed" && await shouldProxyTaskContent(taskRecord)) {
+            return proxyVideoContent(req, res, taskRecord, videoUrl);
+        }
         return res.json({ url: videoUrl });
     } catch (error) {
         console.error("[Gateway GET Content Error]", error.message);

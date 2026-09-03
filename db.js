@@ -71,6 +71,7 @@ async function migrate() {
         poll_path VARCHAR(1024),
         api_key TEXT,
         is_async TINYINT DEFAULT 0,
+        proxy_content TINYINT DEFAULT 0,
         req_mapping LONGTEXT NOT NULL,
         resp_mapping LONGTEXT NOT NULL,
         poll_mapping LONGTEXT,
@@ -82,6 +83,7 @@ async function migrate() {
         INDEX idx_model_bindings_status (status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
+    await addColumnIfMissing("model_bindings", "proxy_content", "TINYINT DEFAULT 0");
     await addColumnIfMissing("async_tasks", "logical_model_id", "INT NULL");
     await addColumnIfMissing("async_tasks", "binding_id", "INT NULL");
     await addColumnIfMissing("async_tasks", "channel_id", "INT NULL");
@@ -89,6 +91,7 @@ async function migrate() {
     await addColumnIfMissing("async_tasks", "poll_path_snapshot", "VARCHAR(1024) NULL");
     await addColumnIfMissing("async_tasks", "poll_mapping_snapshot", "LONGTEXT NULL");
     await addColumnIfMissing("async_tasks", "upstream_api_key_snapshot", "TEXT NULL");
+    await addColumnIfMissing("async_tasks", "proxy_content_snapshot", "TINYINT NULL");
     await addColumnIfMissing("async_tasks", "quota_released", "TINYINT DEFAULT 0");
 
     await run(`INSERT IGNORE INTO logical_models (model_name, status)
