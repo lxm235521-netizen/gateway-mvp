@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS logical_models (
     id INT AUTO_INCREMENT PRIMARY KEY,
     model_name VARCHAR(255) UNIQUE NOT NULL,
     status TINYINT DEFAULT 1,
+    remark TEXT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_logical_models_model_name (model_name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -90,6 +91,82 @@ WHERE NOT EXISTS (
     SELECT 1 FROM channels WHERE name = 'Grok Video' AND base_url = 'https://snumom.com'
 );
 
+INSERT INTO channels (name, base_url, api_key, status)
+SELECT 'YU25 Seedance 视频', 'https://api.yu25.xyz/v1', 'sk-c5242e9efddaf788614fba7be6a92daec6f3b1e9afbe971cd6146623000a0a8b', 1
+WHERE NOT EXISTS (
+    SELECT 1 FROM channels WHERE name = 'YU25 Seedance 视频' AND base_url = 'https://api.yu25.xyz/v1'
+);
+
+INSERT IGNORE INTO logical_models (model_name, status)
+VALUES ('sd-2-v4', 1), ('SD2.0 满血', 1);
+
+INSERT INTO model_bindings (
+    logical_model_id, channel_id, route_path, poll_path, api_key, is_async,
+    proxy_content, error_passthrough, poll_throttle, req_mapping, resp_mapping,
+    poll_mapping, weight, status
+)
+SELECT
+    lm.id, c.id, '/videos', '/videos/${up_task_id}', NULL, 1,
+    1, 0, 0,
+    '$merge([{ "model": "sd-2-v4", "prompt": prompt, "seconds": $number(seconds), "resolution": $exists(resolution) ? resolution : "720p", "aspect_ratio": $exists(aspect_ratio) ? aspect_ratio : "16:9" }, ($count(images) > 0) ? { "images": images } : {}, ($count(videos) > 0) ? { "video_urls": videos } : {}, ($count(audios) > 0) ? { "audio_urls": audios } : {}])',
+    '{ "task_id": $exists(task_id) ? task_id : ($exists(id) ? id : request_id), "id": $exists(id) ? id : ($exists(task_id) ? task_id : request_id), "status": $exists(status) ? status : "queued", "progress": $exists(progress) ? progress : 0, "object": $exists(object) ? object : "video", "model": $exists(model) ? model : "sd-2-v4", "created_at": created_at }',
+    '(
+        $status := $lowercase(status);
+        $resultUrl := $exists(video_url) ? video_url : ($exists(result_url) ? result_url : ($exists(output_url) ? output_url : ($exists(download_url) ? download_url : ($exists(url) ? url : data.url))));
+        {
+            "created_at": created_at,
+            "model": $exists(model) ? model : "sd-2-v4",
+            "object": ($status = "completed" or $status = "succeeded" or $status = "success") ? $resultUrl : "video.generation",
+            "progress": ($status = "completed" or $status = "succeeded" or $status = "success") ? 100 : ($exists(progress) ? progress : 0),
+            "status": ($status = "completed" or $status = "succeeded" or $status = "success" or $status = "done" or $status = "finished") ? "completed" : (($status = "failed" or $status = "error" or $status = "rejected" or $status = "cancelled" or $status = "canceled") ? "failed" : (($status = "queued" or $status = "pending" or $status = "submitted") ? "queued" : "processing")),
+            "video_url": $resultUrl,
+            "result_url": $resultUrl,
+            "error": $exists(error) ? error : ($exists(fail_reason) ? fail_reason : message),
+            "completed_at": completed_at
+        }
+    )',
+    1, 1
+FROM logical_models lm
+JOIN channels c ON c.name = 'YU25 Seedance 视频' AND c.base_url = 'https://api.yu25.xyz/v1'
+WHERE lm.model_name = 'sd-2-v4'
+  AND NOT EXISTS (
+      SELECT 1 FROM model_bindings b
+      WHERE b.logical_model_id = lm.id AND b.channel_id = c.id
+  );
+
+INSERT INTO model_bindings (
+    logical_model_id, channel_id, route_path, poll_path, api_key, is_async,
+    proxy_content, error_passthrough, poll_throttle, req_mapping, resp_mapping,
+    poll_mapping, weight, status
+)
+SELECT
+    lm.id, c.id, '/videos', '/videos/${up_task_id}', NULL, 1,
+    1, 0, 0,
+    '$merge([{ "model": "SD2.0 满血", "prompt": prompt, "seconds": $number(seconds), "resolution": $exists(resolution) ? resolution : "720p", "aspect_ratio": $exists(aspect_ratio) ? aspect_ratio : "16:9" }, ($count(images) > 0) ? { "images": images } : {}, ($count(videos) > 0) ? { "video_urls": videos } : {}, ($count(audios) > 0) ? { "audio_urls": audios } : {}])',
+    '{ "task_id": $exists(task_id) ? task_id : ($exists(id) ? id : request_id), "id": $exists(id) ? id : ($exists(task_id) ? task_id : request_id), "status": $exists(status) ? status : "queued", "progress": $exists(progress) ? progress : 0, "object": $exists(object) ? object : "video", "model": $exists(model) ? model : "SD2.0 满血", "created_at": created_at }',
+    '(
+        $status := $lowercase(status);
+        $resultUrl := $exists(video_url) ? video_url : ($exists(result_url) ? result_url : ($exists(output_url) ? output_url : ($exists(download_url) ? download_url : ($exists(url) ? url : data.url))));
+        {
+            "created_at": created_at,
+            "model": $exists(model) ? model : "SD2.0 满血",
+            "object": ($status = "completed" or $status = "succeeded" or $status = "success") ? $resultUrl : "video.generation",
+            "progress": ($status = "completed" or $status = "succeeded" or $status = "success") ? 100 : ($exists(progress) ? progress : 0),
+            "status": ($status = "completed" or $status = "succeeded" or $status = "success" or $status = "done" or $status = "finished") ? "completed" : (($status = "failed" or $status = "error" or $status = "rejected" or $status = "cancelled" or $status = "canceled") ? "failed" : (($status = "queued" or $status = "pending" or $status = "submitted") ? "queued" : "processing")),
+            "video_url": $resultUrl,
+            "result_url": $resultUrl,
+            "error": $exists(error) ? error : ($exists(fail_reason) ? fail_reason : message),
+            "completed_at": completed_at
+        }
+    )',
+    1, 1
+FROM logical_models lm
+JOIN channels c ON c.name = 'YU25 Seedance 视频' AND c.base_url = 'https://api.yu25.xyz/v1'
+WHERE lm.model_name = 'SD2.0 满血'
+  AND NOT EXISTS (
+      SELECT 1 FROM model_bindings b
+      WHERE b.logical_model_id = lm.id AND b.channel_id = c.id
+  );
 INSERT INTO channel_models (
     channel_id, model_name, route_path, poll_path, api_key, is_async,
     req_mapping, resp_mapping, poll_mapping, weight, status

@@ -85,9 +85,9 @@ module.exports = function(db) {
     });
 
     router.post("/models", adminAuth, async (req, res) => {
-        const { model_name, status, bindings } = req.body;
+        const { model_name, status, remark, bindings } = req.body;
         try {
-            const result = await db.run("INSERT INTO logical_models (model_name, status) VALUES (?, ?)", [model_name, status !== undefined ? status : 1]);
+            const result = await db.run("INSERT INTO logical_models (model_name, status, remark) VALUES (?, ?, ?)", [model_name, status !== undefined ? status : 1, remark || null]);
             const modelId = result.insertId;
             for (const binding of bindings || []) {
                 const item = normalizeBinding(binding);
@@ -100,9 +100,9 @@ module.exports = function(db) {
     });
 
     router.put("/models/:id", adminAuth, async (req, res) => {
-        const { model_name, status, bindings } = req.body;
+        const { model_name, status, remark, bindings } = req.body;
         try {
-            await db.run("UPDATE logical_models SET model_name=?, status=? WHERE id=?", [model_name, status !== undefined ? status : 1, req.params.id]);
+            await db.run("UPDATE logical_models SET model_name=?, status=?, remark=? WHERE id=?", [model_name, status !== undefined ? status : 1, remark || null, req.params.id]);
             if (Array.isArray(bindings)) {
                 for (const binding of bindings) {
                     const item = normalizeBinding(binding);

@@ -59,9 +59,12 @@ async function migrate() {
         id INT AUTO_INCREMENT PRIMARY KEY,
         model_name VARCHAR(255) UNIQUE NOT NULL,
         status TINYINT DEFAULT 1,
+        remark TEXT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_logical_models_model_name (model_name)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
+    await addColumnIfMissing("logical_models", "remark", "TEXT NULL");
 
     await run(`CREATE TABLE IF NOT EXISTS model_bindings (
         id INT AUTO_INCREMENT PRIMARY KEY,

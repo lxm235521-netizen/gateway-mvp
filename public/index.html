@@ -67,6 +67,7 @@
                     </el-table-column>
                     <el-table-column prop="id" label="ID" width="70"></el-table-column>
                     <el-table-column prop="model_name" label="下游模型名"></el-table-column>
+                    <el-table-column prop="remark" label="备注" show-overflow-tooltip></el-table-column>
                     <el-table-column label="绑定渠道数" width="120"><template #default="scope">{{ scope.row.bindings ? scope.row.bindings.length : 0 }}</template></el-table-column>
                     <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status ? 'success' : 'danger'">{{ scope.row.status ? '启用' : '禁用' }}</el-tag></template></el-table-column>
                     <el-table-column label="操作" width="180" fixed="right">
@@ -108,6 +109,7 @@
                         <el-form-item label="下游请求模型名"><el-input v-model="dialogForm.model_name" placeholder="例如: sora-video"></el-input></el-form-item>
                         <el-form-item label="模型状态"><el-switch v-model="dialogForm.status" :active-value="1" :inactive-value="0" active-text="启用" inactive-text="禁用"></el-switch></el-form-item>
                     </div>
+                    <el-form-item label="备注"><el-input v-model="dialogForm.remark" placeholder="模型用途、说明等（可选）"></el-input></el-form-item>
                     <el-divider content-position="left">渠道绑定</el-divider>
                     <div v-for="(binding, index) in dialogForm.bindings" :key="binding.local_id" class="binding-card">
                         <div class="binding-title">
@@ -257,7 +259,7 @@ const app = createApp({
                 dialogForm.value = JSON.parse(JSON.stringify(row));
                 dialogForm.value.bindings = (dialogForm.value.bindings || []).map(normalizeBinding);
             } else {
-                dialogForm.value = { model_name: "", status: 1, bindings: [defaultBinding()] };
+                dialogForm.value = { model_name: "", status: 1, remark: "", bindings: [defaultBinding()] };
             }
             dialogVisible.value = true;
         }
