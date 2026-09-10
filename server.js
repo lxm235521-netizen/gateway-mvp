@@ -55,7 +55,7 @@ async function authMiddleware(req, res, next) {
             return res.status(401).json({ error: "Invalid or disabled API Key" });
         }
         if (keyRecord) {
-            if (keyRecord.quota <= keyRecord.used_quota) {
+            if (keyRecord.quota >= 0 && keyRecord.quota <= keyRecord.used_quota) {
                 return res.status(402).json({ error: "Insufficient quota" });
             }
             req.gatewayKey = keyRecord;
