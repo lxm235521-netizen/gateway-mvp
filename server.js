@@ -350,6 +350,14 @@ async function selectModelBinding(modelName) {
     return selectBinding(bindings);
 }
 
+function tryPassthroughUpstreamError(res, error, passthrough) {
+    if (passthrough && error.response) {
+        res.status(error.response.status).json(error.response.data);
+        return true;
+    }
+    return false;
+}
+
 async function sendMappedPost(binding, body, logLabel, options = {}) {
     const upstreamPayload = await executeMapping(binding.req_mapping, body);
     const upstreamKey = options.upstreamKey || binding.api_key || binding.channel_api_key;
@@ -401,6 +409,16 @@ async function pollAsyncTask(taskRecord) {
     pollResult.id = taskRecord.gw_task_id;
     pollResult.task_id = taskRecord.gw_task_id;
     return pollResult;
+}
+
+async function getTaskErrorPassthrough(taskRecord) {
+    try {
+        if (!taskRecord || !taskRecord.binding_id) return false;
+        const binding = await db.get("SELECT error_passthrough FROM model_bindings WHERE id = ?", [taskRecord.binding_id]);
+        return Boolean(binding && binding.error_passthrough);
+    } catch (error) {
+        return false;
+    }
 }
 
 async function updateTaskStatus(taskRecord, pollResult) {
@@ -508,8 +526,9 @@ async function proxyVideoContent(req, res, taskRecord, videoUrl) {
 }
 
 app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
+    let binding;
     try {
-        const binding = await selectModelBinding(req.body.model);
+        binding = await selectModelBinding(req.body.model);
         if (!binding) {
             return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
@@ -522,14 +541,16 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
         });
         return res.json(gwResponse);
     } catch (error) {
+        if (tryPassthroughUpstreamError(res, error, binding && binding.error_passthrough)) return;
         console.error("[Gateway POST completions Error]", error.response ? error.response.data : error.message);
         return res.status(500).json({ error: "Upstream request failed", details: error.message });
     }
 });
 
 app.post(["/v1/images/generations", "/v1/images/edits"], authMiddleware, async (req, res) => {
+    let binding;
     try {
-        const binding = await selectModelBinding(req.body.model);
+        binding = await selectModelBinding(req.body.model);
         if (!binding) {
             return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
@@ -542,14 +563,16 @@ app.post(["/v1/images/generations", "/v1/images/edits"], authMiddleware, async (
         }
         return res.json(gwResponse);
     } catch (error) {
+        if (tryPassthroughUpstreamError(res, error, binding && binding.error_passthrough)) return;
         console.error("[Gateway POST Images Error]", error.response ? error.response.data : error.message);
         return res.status(500).json({ error: "Upstream request failed", details: error.message });
     }
 });
 
 app.post("/v1/videos", authMiddleware, async (req, res) => {
+    let binding;
     try {
-        const binding = await selectModelBinding(req.body.model);
+        binding = await selectModelBinding(req.body.model);
         if (!binding) {
             return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
@@ -597,14 +620,16 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
             created_at: Math.floor(Date.now() / 1000)
         });
     } catch (error) {
+        if (tryPassthroughUpstreamError(res, error, binding && binding.error_passthrough)) return;
         console.error("[Gateway POST videos Error]", error.response ? error.response.data : error.message);
         return res.status(500).json({ error: "Upstream request failed" });
     }
 });
 
 app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
+    let taskRecord;
     try {
-        const taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [req.params.task_id]);
+        taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [req.params.task_id]);
         if (!taskRecord) {
             return res.status(404).json({ error: "Task not found" });
         }
@@ -616,14 +641,16 @@ app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
         }
         return res.json(pollResult);
     } catch (error) {
+        if (tryPassthroughUpstreamError(res, error, await getTaskErrorPassthrough(taskRecord))) return;
         console.error("[Gateway GET Error]", error.message);
         return res.status(500).json({ error: "Failed to poll upstream status" });
     }
 });
 
 app.get("/v1/videos/:task_id/content", authMiddleware, async (req, res) => {
+    let taskRecord;
     try {
-        const taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [req.params.task_id]);
+        taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [req.params.task_id]);
         if (!taskRecord) {
             return res.status(404).json({ error: "Task not found" });
         }
@@ -636,6 +663,7 @@ app.get("/v1/videos/:task_id/content", authMiddleware, async (req, res) => {
         }
         return res.json({ url: videoUrl });
     } catch (error) {
+        if (tryPassthroughUpstreamError(res, error, await getTaskErrorPassthrough(taskRecord))) return;
         console.error("[Gateway GET Content Error]", error.message);
         return res.status(500).json({ error: "Failed to poll upstream status" });
     }

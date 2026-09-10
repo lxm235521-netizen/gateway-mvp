@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS model_bindings (
     api_key TEXT,
     is_async TINYINT DEFAULT 0,
     proxy_content TINYINT DEFAULT 0,
+    error_passthrough TINYINT DEFAULT 0,
     req_mapping LONGTEXT NOT NULL,
     resp_mapping LONGTEXT NOT NULL,
     poll_mapping LONGTEXT,

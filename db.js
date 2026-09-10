@@ -84,6 +84,7 @@ async function migrate() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
     await addColumnIfMissing("model_bindings", "proxy_content", "TINYINT DEFAULT 0");
+    await addColumnIfMissing("model_bindings", "error_passthrough", "TINYINT DEFAULT 0");
     await addColumnIfMissing("async_tasks", "logical_model_id", "INT NULL");
     await addColumnIfMissing("async_tasks", "binding_id", "INT NULL");
     await addColumnIfMissing("async_tasks", "channel_id", "INT NULL");
