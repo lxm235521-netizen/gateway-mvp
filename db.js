@@ -85,6 +85,7 @@ async function migrate() {
 
     await addColumnIfMissing("model_bindings", "proxy_content", "TINYINT DEFAULT 0");
     await addColumnIfMissing("model_bindings", "error_passthrough", "TINYINT DEFAULT 0");
+    await addColumnIfMissing("model_bindings", "poll_throttle", "TINYINT DEFAULT 0");
     await addColumnIfMissing("async_tasks", "logical_model_id", "INT NULL");
     await addColumnIfMissing("async_tasks", "binding_id", "INT NULL");
     await addColumnIfMissing("async_tasks", "channel_id", "INT NULL");
@@ -93,6 +94,8 @@ async function migrate() {
     await addColumnIfMissing("async_tasks", "poll_mapping_snapshot", "LONGTEXT NULL");
     await addColumnIfMissing("async_tasks", "upstream_api_key_snapshot", "TEXT NULL");
     await addColumnIfMissing("async_tasks", "proxy_content_snapshot", "TINYINT NULL");
+    await addColumnIfMissing("async_tasks", "poll_throttle_snapshot", "TINYINT NULL");
+    await addColumnIfMissing("async_tasks", "last_poll_at", "DATETIME NULL");
     await addColumnIfMissing("async_tasks", "quota_released", "TINYINT DEFAULT 0");
 
     await run(`INSERT IGNORE INTO logical_models (model_name, status)

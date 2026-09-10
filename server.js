@@ -432,6 +432,48 @@ async function updateTaskStatus(taskRecord, pollResult) {
     }
 }
 
+async function isPollThrottleEnabled(taskRecord) {
+    if (taskRecord.poll_throttle_snapshot !== null && taskRecord.poll_throttle_snapshot !== undefined) {
+        return Boolean(taskRecord.poll_throttle_snapshot);
+    }
+    if (!taskRecord.binding_id) {
+        return false;
+    }
+    const binding = await db.get("SELECT poll_throttle FROM model_bindings WHERE id = ?", [taskRecord.binding_id]);
+    return Boolean(binding && binding.poll_throttle);
+}
+
+async function claimPollSlot(taskRecord) {
+    const intervalSec = Number(process.env.POLL_MIN_INTERVAL_SECONDS || 6);
+    const result = await db.run(
+        "UPDATE async_tasks SET last_poll_at = NOW() WHERE gw_task_id = ? AND (last_poll_at IS NULL OR last_poll_at <= NOW() - INTERVAL ? SECOND)",
+        [taskRecord.gw_task_id, intervalSec]
+    );
+    return result.affectedRows > 0;
+}
+
+function isPollRateLimited(error) {
+    const res = error.response;
+    if (res && res.status === 429) {
+        return true;
+    }
+    const data = res && res.data;
+    if (!data) {
+        return false;
+    }
+    const text = typeof data === "string" ? data : JSON.stringify(data);
+    return /rate[_\s-]?limit/i.test(text);
+}
+
+function buildQueuedPollResponse(taskRecord) {
+    return {
+        id: taskRecord.gw_task_id,
+        task_id: taskRecord.gw_task_id,
+        status: "queued",
+        progress: 0
+    };
+}
+
 async function shouldProxyTaskContent(taskRecord) {
     if (taskRecord.proxy_content_snapshot !== null && taskRecord.proxy_content_snapshot !== undefined) {
         return Boolean(taskRecord.proxy_content_snapshot);
@@ -593,8 +635,8 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
         await db.run(`INSERT INTO async_tasks (
                 gw_task_id, up_task_id, gw_key_id, model_id, logical_model_id, binding_id, channel_id,
                 upstream_base_url, poll_path_snapshot, poll_mapping_snapshot, upstream_api_key_snapshot,
-                proxy_content_snapshot
-            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                proxy_content_snapshot, poll_throttle_snapshot
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             gwTaskId,
             upTaskId,
             req.gatewayKey ? req.gatewayKey.id : null,
@@ -605,7 +647,8 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
             binding.poll_path,
             binding.poll_mapping,
             upstreamKey,
-            binding.proxy_content ? 1 : 0
+            binding.proxy_content ? 1 : 0,
+            binding.poll_throttle ? 1 : 0
         ]);
         if (req.gatewayKey) {
             await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
@@ -628,10 +671,16 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
 
 app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
     let taskRecord;
+    let pollThrottle = false;
     try {
         taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [req.params.task_id]);
         if (!taskRecord) {
             return res.status(404).json({ error: "Task not found" });
+        }
+
+        pollThrottle = await isPollThrottleEnabled(taskRecord);
+        if (pollThrottle && !(await claimPollSlot(taskRecord))) {
+            return res.json(buildQueuedPollResponse(taskRecord));
         }
 
         const pollResult = await pollAsyncTask(taskRecord);
@@ -641,6 +690,9 @@ app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
         }
         return res.json(pollResult);
     } catch (error) {
+        if (pollThrottle && isPollRateLimited(error)) {
+            return res.json(buildQueuedPollResponse(taskRecord));
+        }
         if (tryPassthroughUpstreamError(res, error, await getTaskErrorPassthrough(taskRecord))) return;
         console.error("[Gateway GET Error]", error.message);
         return res.status(500).json({ error: "Failed to poll upstream status" });
@@ -649,10 +701,16 @@ app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
 
 app.get("/v1/videos/:task_id/content", authMiddleware, async (req, res) => {
     let taskRecord;
+    let pollThrottle = false;
     try {
         taskRecord = await db.get("SELECT * FROM async_tasks WHERE gw_task_id = ?", [req.params.task_id]);
         if (!taskRecord) {
             return res.status(404).json({ error: "Task not found" });
+        }
+
+        pollThrottle = await isPollThrottleEnabled(taskRecord);
+        if (pollThrottle && !(await claimPollSlot(taskRecord))) {
+            return res.json({ url: "" });
         }
 
         const pollResult = await pollAsyncTask(taskRecord);
@@ -663,6 +721,9 @@ app.get("/v1/videos/:task_id/content", authMiddleware, async (req, res) => {
         }
         return res.json({ url: videoUrl });
     } catch (error) {
+        if (pollThrottle && isPollRateLimited(error)) {
+            return res.json({ url: "" });
+        }
         if (tryPassthroughUpstreamError(res, error, await getTaskErrorPassthrough(taskRecord))) return;
         console.error("[Gateway GET Content Error]", error.message);
         return res.status(500).json({ error: "Failed to poll upstream status" });

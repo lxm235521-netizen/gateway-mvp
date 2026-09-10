@@ -10,6 +10,7 @@ services:
       DB_PASSWORD: ${DB_PASSWORD}
       ADMIN_USER: ${ADMIN_USER}
       ADMIN_PASS: ${ADMIN_PASS}
+      POLL_MIN_INTERVAL_SECONDS: ${POLL_MIN_INTERVAL_SECONDS:-6}
     ports:
       - "3009:3000"
     restart: unless-stopped
