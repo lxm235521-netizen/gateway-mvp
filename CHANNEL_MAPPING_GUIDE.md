@@ -112,6 +112,13 @@ Authorization: Bearer sk-your-api-key
 
 重要：当前 `/v1/videos/{task_id}/content` 会读取 `poll_mapping` 结果中的 `video_url` 字段。因此如果上游完成后返回字段叫 `result_url`、`url`、`data[0].url` 等，必须在 `poll_mapping` 中映射为 `video_url`。
 
+视频内容接口 `GET /v1/videos/{task_id}/content` 支持匿名访问，无需携带 Authorization。
+开启网关代理后，浏览器或播放器可直接使用该链接，支持 Range 请求。
+网关访问同源视频地址时使用任务保存的上游密钥与鉴权方式；跨域视频地址首次不附加渠道密钥，保留链接自身的签名或 token 参数。
+跨域下载返回 401/403 且任务保存了上游密钥时，网关内部携带该密钥重试一次，沿用保存的 Bearer 或 X-Auth-Token 鉴权方式，并保留 Range/If-Range 请求头。
+首次 401/403 不直接返回下游；重试成功则返回视频，仍失败则返回网关 502 和最终 upstream_status。其他 HTTP 错误或没有保存密钥时不重试。
+创建任务和查询状态仍需要 Bearer 鉴权。
+
 ## 4. 图片生成下游模板
 
 下游图片生成统一请求目前也按统一字段进入网关：
@@ -350,3 +357,24 @@ Quality V4 不支持下游模板中的 `videos` 和 `audios`，因此该绑定�
 - 不要映射上游不支持的媒体字段。
 - 不要把上游文档里的示例 URL、示例 key、示例 prompt 当成生产配置。
 - 如果下游使用网关自有 key，必须在渠道或绑定中配置上游 key，否则上游请求可能没有有效鉴权。
+
+## 10. 非 Bearer 渠道与 Vylai MiniMax H3
+
+渠道的 `auth_type` 默认为 `bearer`，也可在后台选择 `x-auth-token`。
+后者把选中的上游密钥发送为 `X-Auth-Token: <key>`；密钥优先级不变。
+提交、轮询和开启代理时的同源视频内容请求均使用该方式。新任务保存
+`upstream_auth_type_snapshot`，旧任务无快照时继续使用 Bearer。
+修改已有渠道鉴权方式不会改变已提交任务。
+
+Vylai MiniMax H3 使用 `https://queueapi.vylai.com`，鉴权为 `x-auth-token`。
+三个模板及可复用的映射位于 `scripts/vylai-minimax-config.js`。
+`prompt` 映射为 `extra_data.text`，`seconds` 映射为 `config_values.duration`，
+`aspect_ratio` 映射为 `config_values.aspect`；图片与音频分别使用 `image_path`、`audio_path`。
+Fast 模板必须提供图片且不支持音频，所有模板都不映射视频输入。
+未提供 resolution 时省略该配置，使用上游模板默认值。
+创建响应使用 `data.task_id`，完成结果使用 `data.result_oss_url`，按结果直链返回。
+文档未提供真实 Key，首次配置后需要在后台填写渠道默认密钥，或通过下游 Bearer Key 透传上游 Key。
+
+在运行中的网关容器内执行配置脚本，以复用其实际数据库连接；脚本要求显式设置
+`EXPECTED_DB_HOST` 和 `EXPECTED_DB_NAME` 并核对连接，匹配已有记录时不会重复添加。
+配置脚本只创建渠道和模型，不发起付费生成请求。

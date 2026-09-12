@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
 const jsonata = require("jsonata");
@@ -6,6 +6,7 @@ const morgan = require("morgan");
 const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");
+const { buildAuthHeaders } = require("./upstream-auth");
 
 const app = express();
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "50mb" }));
@@ -295,8 +296,8 @@ async function buildMultipartRequest(payload) {
     return form;
 }
 
-async function buildPostOptions(upstreamKey, upstreamPayload) {
-    const headers = upstreamKey ? { "Authorization": `Bearer ${upstreamKey}` } : {};
+async function buildPostOptions(upstreamKey, upstreamPayload, authType) {
+    const headers = buildAuthHeaders(upstreamKey, authType);
     if (!isMultipartPayload(upstreamPayload)) {
         return { data: stripGatewayMeta(upstreamPayload), options: { headers } };
     }
@@ -320,6 +321,7 @@ async function loadActiveBindings(modelName) {
             lm.model_name,
             c.base_url,
             c.api_key AS channel_api_key,
+            c.auth_type AS channel_auth_type,
             c.name AS channel_name
         FROM logical_models lm
         JOIN model_bindings b ON b.logical_model_id = lm.id
@@ -364,7 +366,7 @@ async function sendMappedPost(binding, body, logLabel, options = {}) {
     const upstreamUrl = resolveUpstreamUrl(binding, upstreamPayload);
 
     console.log(`[${logLabel}] Routing ${binding.model_name} to ${binding.channel_name}: ${upstreamUrl}`);
-    const postRequest = await buildPostOptions(upstreamKey, upstreamPayload);
+    const postRequest = await buildPostOptions(upstreamKey, upstreamPayload, binding.channel_auth_type);
     const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
     const gwResponse = await executeMapping(binding.resp_mapping, upstreamRes.data);
 
@@ -372,7 +374,7 @@ async function sendMappedPost(binding, body, logLabel, options = {}) {
 }
 
 async function loadLegacyPollRuntime(taskRecord) {
-    const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?", [taskRecord.model_id]);
+    const modelRecord = await db.get("SELECT m.*, c.base_url, c.api_key as channel_api_key, c.auth_type FROM channel_models m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?", [taskRecord.model_id]);
     if (!modelRecord) {
         return null;
     }
@@ -380,7 +382,8 @@ async function loadLegacyPollRuntime(taskRecord) {
         base_url: modelRecord.base_url,
         poll_path: modelRecord.poll_path,
         poll_mapping: modelRecord.poll_mapping,
-        upstream_key: modelRecord.api_key || modelRecord.channel_api_key
+        upstream_key: modelRecord.api_key || modelRecord.channel_api_key,
+        auth_type: modelRecord.auth_type
     };
 }
 
@@ -390,7 +393,8 @@ async function pollAsyncTask(taskRecord) {
             base_url: taskRecord.upstream_base_url,
             poll_path: taskRecord.poll_path_snapshot,
             poll_mapping: taskRecord.poll_mapping_snapshot,
-            upstream_key: taskRecord.upstream_api_key_snapshot
+            upstream_key: taskRecord.upstream_api_key_snapshot,
+            auth_type: taskRecord.upstream_auth_type_snapshot
         }
         : await loadLegacyPollRuntime(taskRecord);
 
@@ -402,7 +406,7 @@ async function pollAsyncTask(taskRecord) {
     upPollPath = upPollPath.replace("${up_task_id}", taskRecord.up_task_id);
 
     const upstreamRes = await axios.get(runtime.base_url + upPollPath, {
-        headers: runtime.upstream_key ? { "Authorization": `Bearer ${runtime.upstream_key}` } : {}
+        headers: buildAuthHeaders(runtime.upstream_key, runtime.auth_type)
     });
 
     const pollResult = await executeMapping(runtime.poll_mapping, upstreamRes.data);
@@ -506,10 +510,14 @@ async function proxyVideoContent(req, res, taskRecord, videoUrl) {
         return res.status(502).json({ error: "Upstream video URL is missing or invalid" });
     }
 
-    const headers = {};
-    if (taskRecord.upstream_api_key_snapshot) {
-        headers.Authorization = "Bearer " + taskRecord.upstream_api_key_snapshot;
-    }
+    // Result URLs may carry their own token on a different provider's host.
+    // Send channel credentials immediately only to the original upstream origin.
+    const sameOrigin = isHttpUrl(taskRecord.upstream_base_url)
+        && new URL(videoUrl).origin === new URL(taskRecord.upstream_base_url).origin;
+    const channelHeaders = sameOrigin
+        ? buildAuthHeaders(taskRecord.upstream_api_key_snapshot, taskRecord.upstream_auth_type_snapshot)
+        : {};
+    const headers = { ...channelHeaders };
     if (req.headers.range) {
         headers.Range = req.headers.range;
     }
@@ -517,14 +525,23 @@ async function proxyVideoContent(req, res, taskRecord, videoUrl) {
         headers["If-Range"] = req.headers["if-range"];
     }
 
-    const upstreamRes = await axios.get(videoUrl, {
-        headers,
+    const requestVideo = requestHeaders => axios.get(videoUrl, {
+        headers: requestHeaders,
         responseType: "stream",
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
         timeout: Number(process.env.UPSTREAM_VIDEO_TIMEOUT_MS || 30000),
         validateStatus: () => true
     });
+    let upstreamRes = await requestVideo(headers);
+
+    // Some providers return signed cross-origin URLs, while others require
+    // the original channel credential. Try the URL first, then fall back to
+    // the saved credential only when the provider explicitly asks for it.
+    if (!sameOrigin && (upstreamRes.status === 401 || upstreamRes.status === 403) && taskRecord.upstream_api_key_snapshot) {
+        upstreamRes.data.destroy();
+        upstreamRes = await requestVideo({ ...headers, ...buildAuthHeaders(taskRecord.upstream_api_key_snapshot, taskRecord.upstream_auth_type_snapshot) });
+    }
 
     if (upstreamRes.status < 200 || upstreamRes.status >= 300) {
         upstreamRes.data.resume();
@@ -635,8 +652,8 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
         await db.run(`INSERT INTO async_tasks (
                 gw_task_id, up_task_id, gw_key_id, model_id, logical_model_id, binding_id, channel_id,
                 upstream_base_url, poll_path_snapshot, poll_mapping_snapshot, upstream_api_key_snapshot,
-                proxy_content_snapshot, poll_throttle_snapshot
-            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                proxy_content_snapshot, poll_throttle_snapshot, upstream_auth_type_snapshot
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             gwTaskId,
             upTaskId,
             req.gatewayKey ? req.gatewayKey.id : null,
@@ -648,7 +665,8 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
             binding.poll_mapping,
             upstreamKey,
             binding.proxy_content ? 1 : 0,
-            binding.poll_throttle ? 1 : 0
+            binding.poll_throttle ? 1 : 0,
+            binding.channel_auth_type || "bearer"
         ]);
         if (req.gatewayKey) {
             await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
@@ -699,7 +717,8 @@ app.get("/v1/videos/:task_id", authMiddleware, async (req, res) => {
     }
 });
 
-app.get("/v1/videos/:task_id/content", authMiddleware, async (req, res) => {
+// Content links are public so browsers and video players can fetch them directly.
+app.get("/v1/videos/:task_id/content", async (req, res) => {
     let taskRecord;
     let pollThrottle = false;
     try {
@@ -740,8 +759,10 @@ async function start() {
     });
 }
 
-start().catch(error => {
+if (require.main === module) start().catch(error => {
     console.error("Failed to start gateway:", error.message);
     process.exit(1);
 });
 
+
+module.exports = { app, start };

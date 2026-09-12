@@ -55,6 +55,8 @@ async function addColumnIfMissing(tableName, columnName, definition) {
 }
 
 async function migrate() {
+    await addColumnIfMissing("channels", "auth_type", "VARCHAR(32) NOT NULL DEFAULT 'bearer'");
+    await addColumnIfMissing("async_tasks", "upstream_auth_type_snapshot", "VARCHAR(32) NULL");
     await run(`CREATE TABLE IF NOT EXISTS logical_models (
         id INT AUTO_INCREMENT PRIMARY KEY,
         model_name VARCHAR(255) UNIQUE NOT NULL,
@@ -87,7 +89,8 @@ async function migrate() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
     await addColumnIfMissing("model_bindings", "proxy_content", "TINYINT DEFAULT 0");
-    await addColumnIfMissing("model_bindings", "error_passthrough", "TINYINT DEFAULT 0");
+    await addColumnIfMissing("model_bindings", "error_passthrough", "TINYINT DEFAULT 1");
+    await run("ALTER TABLE model_bindings MODIFY COLUMN error_passthrough TINYINT DEFAULT 1");
     await addColumnIfMissing("model_bindings", "poll_throttle", "TINYINT DEFAULT 0");
     await addColumnIfMissing("async_tasks", "logical_model_id", "INT NULL");
     await addColumnIfMissing("async_tasks", "binding_id", "INT NULL");

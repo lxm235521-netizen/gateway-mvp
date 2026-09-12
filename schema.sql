@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS channels (
     name VARCHAR(255) NOT NULL,
     base_url VARCHAR(1024) NOT NULL,
     api_key TEXT,
+    auth_type VARCHAR(32) NOT NULL DEFAULT 'bearer',
     status TINYINT DEFAULT 1
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS model_bindings (
     api_key TEXT,
     is_async TINYINT DEFAULT 0,
     proxy_content TINYINT DEFAULT 0,
-    error_passthrough TINYINT DEFAULT 0,
+    error_passthrough TINYINT DEFAULT 1,
     poll_throttle TINYINT DEFAULT 0,
     req_mapping LONGTEXT NOT NULL,
     resp_mapping LONGTEXT NOT NULL,
@@ -74,6 +75,7 @@ CREATE TABLE IF NOT EXISTS async_tasks (
     poll_path_snapshot VARCHAR(1024),
     poll_mapping_snapshot LONGTEXT,
     upstream_api_key_snapshot TEXT,
+    upstream_auth_type_snapshot VARCHAR(32) NULL,
     proxy_content_snapshot TINYINT NULL,
     poll_throttle_snapshot TINYINT NULL,
     quota_released TINYINT DEFAULT 0,

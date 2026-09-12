@@ -85,6 +85,7 @@
                     <el-table-column prop="id" label="ID" width="60"></el-table-column>
                     <el-table-column prop="name" label="渠道名称" width="200"></el-table-column>
                     <el-table-column prop="base_url" label="Base URL"></el-table-column>
+                    <el-table-column label="鉴权方式" width="150"><template #default="scope">{{ scope.row.auth_type === 'x-auth-token' ? 'X-Auth-Token' : 'Bearer Token' }}</template></el-table-column>
                     <el-table-column label="默认密钥"><template #default="scope">{{ scope.row.api_key ? '已设置' : '未设置' }}</template></el-table-column>
                     <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status ? 'success' : 'danger'">{{ scope.row.status ? '启用' : '禁用' }}</el-tag></template></el-table-column>
                     <el-table-column label="操作" width="120" fixed="right"><template #default="scope"><el-button size="small" type="primary" link @click="openChannelDialog(scope.row)">编辑</el-button></template></el-table-column>
@@ -152,6 +153,7 @@
                     <el-form-item label="渠道名称"><el-input v-model="channelForm.name"></el-input></el-form-item>
                     <el-form-item label="上游 BaseURL"><el-input v-model="channelForm.base_url"></el-input></el-form-item>
                     <el-form-item label="渠道默认密钥"><el-input v-model="channelForm.api_key" show-password></el-input></el-form-item>
+                    <el-form-item label="上游鉴权方式"><el-select v-model="channelForm.auth_type" style="width:100%"><el-option label="Bearer Token" value="bearer"></el-option><el-option label="X-Auth-Token" value="x-auth-token"></el-option></el-select></el-form-item>
                     <el-form-item label="是否启用"><el-switch v-model="channelForm.status" :active-value="1" :inactive-value="0"></el-switch></el-form-item>
                 </el-form>
                 <template #footer><el-button @click="channelDialogVisible = false">取消</el-button><el-button type="primary" @click="saveChannel">保存渠道</el-button></template>
@@ -240,7 +242,7 @@ const app = createApp({
                 api_key: "",
                 is_async: 1,
                 proxy_content: 0,
-                error_passthrough: 0,
+                error_passthrough: 1,
                 poll_throttle: 0,
                 req_mapping: "{\n  \"model\": model,\n  \"prompt\": prompt\n}",
                 resp_mapping: "{\n  \"task_id\": id,\n  \"status\": status\n}",
@@ -301,7 +303,7 @@ const app = createApp({
             if (res && res.success) { ElementPlus.ElMessage.success("保存成功"); dialogVisible.value = false; fetchData(); }
         }
 
-        function openChannelDialog(row = null) { channelForm.value = row ? JSON.parse(JSON.stringify(row)) : { status: 1 }; channelDialogVisible.value = true; }
+        function openChannelDialog(row = null) { channelForm.value = row ? { auth_type: "bearer", ...JSON.parse(JSON.stringify(row)) } : { status: 1, auth_type: "bearer" }; channelDialogVisible.value = true; }
         async function saveChannel() {
             if (!channelForm.value.name || !channelForm.value.base_url) return ElementPlus.ElMessage.warning("名称和URL不能为空");
             const method = channelForm.value.id ? "PUT" : "POST";

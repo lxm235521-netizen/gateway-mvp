@@ -1,5 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
+const { normalizeAuthType } = require("./upstream-auth");
 const router = express.Router();
 
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
@@ -31,7 +32,7 @@ function normalizeBinding(binding) {
         api_key: binding.api_key || null,
         is_async: binding.is_async ? 1 : 0,
         proxy_content: binding.proxy_content ? 1 : 0,
-        error_passthrough: binding.error_passthrough ? 1 : 0,
+        error_passthrough: binding.error_passthrough === undefined ? 1 : (binding.error_passthrough ? 1 : 0),
         poll_throttle: binding.poll_throttle ? 1 : 0,
         req_mapping: binding.req_mapping || "{}",
         resp_mapping: binding.resp_mapping || "{}",
@@ -58,16 +59,24 @@ module.exports = function(db) {
 
     router.post("/channels", adminAuth, async (req, res) => {
         const { name, base_url, api_key, status } = req.body;
+        let authType;
+        try { authType = normalizeAuthType(req.body.auth_type); }
+        catch (e) { return res.status(400).json({ error: e.message }); }
         try {
-            await db.run("INSERT INTO channels (name, base_url, api_key, status) VALUES (?, ?, ?, ?)", [name, base_url, api_key || null, status !== undefined ? status : 1]);
+            await db.run("INSERT INTO channels (name, base_url, api_key, status, auth_type) VALUES (?, ?, ?, ?, ?)", [name, base_url, api_key || null, status !== undefined ? status : 1, authType]);
             res.json({ success: true });
         } catch (e) { res.status(500).json({ error: e.message }); }
     });
 
     router.put("/channels/:id", adminAuth, async (req, res) => {
         const { name, base_url, api_key, status } = req.body;
+        let authType = null;
+        if (req.body.auth_type !== undefined) {
+            try { authType = normalizeAuthType(req.body.auth_type); }
+            catch (e) { return res.status(400).json({ error: e.message }); }
+        }
         try {
-            await db.run("UPDATE channels SET name=?, base_url=?, api_key=?, status=? WHERE id=?", [name, base_url, api_key || null, status !== undefined ? status : 1, req.params.id]);
+            await db.run("UPDATE channels SET name=?, base_url=?, api_key=?, status=?, auth_type=COALESCE(?, auth_type) WHERE id=?", [name, base_url, api_key || null, status !== undefined ? status : 1, authType, req.params.id]);
             res.json({ success: true });
         } catch (e) { res.status(500).json({ error: e.message }); }
     });
