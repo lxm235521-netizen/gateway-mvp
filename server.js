@@ -214,7 +214,7 @@ async function convertBase64Images(value, key = "") {
     if (typeof value === "string") {
         if (/^data:image\//i.test(value)) return await uploadBase64Image(value);
         // OpenAI-compatible payloads may put raw image data in b64_json/base64.
-        if (/^(b64_json|base64)$/i.test(key) && /^[A-Za-z0-9+/\s]+=*$/.test(value) && value.length > 32) {
+        if (/^(images|image|b64_json|base64)$/i.test(key) && /^[A-Za-z0-9+/\s]+=*$/.test(value) && value.length > 32) {
             return await uploadBase64Image(`data:image/png;base64,${value.replace(/\s/g, "")}`);
         }
         return value;
