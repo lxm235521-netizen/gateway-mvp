@@ -210,13 +210,18 @@ async function uploadBase64Image(source) {
     return response.data.url;
 }
 
-async function convertBase64Images(value) {
+async function convertBase64Images(value, key = "") {
     if (typeof value === "string") {
-        return /^data:image\//i.test(value) ? await uploadBase64Image(value) : value;
+        if (/^data:image\//i.test(value)) return await uploadBase64Image(value);
+        // OpenAI-compatible payloads may put raw image data in b64_json/base64.
+        if (/^(b64_json|base64)$/i.test(key) && /^[A-Za-z0-9+/\s]+=*$/.test(value) && value.length > 32) {
+            return await uploadBase64Image(`data:image/png;base64,${value.replace(/\s/g, "")}`);
+        }
+        return value;
     }
-    if (Array.isArray(value)) return Promise.all(value.map(convertBase64Images));
+    if (Array.isArray(value)) return Promise.all(value.map(item => convertBase64Images(item, key)));
     if (isObject(value)) {
-        const entries = await Promise.all(Object.entries(value).map(async ([key, item]) => [key, await convertBase64Images(item)]));
+        const entries = await Promise.all(Object.entries(value).map(async ([childKey, item]) => [childKey, await convertBase64Images(item, childKey)]));
         return Object.fromEntries(entries);
     }
     return value;
