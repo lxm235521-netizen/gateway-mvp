@@ -121,7 +121,18 @@ Authorization: Bearer sk-your-api-key
 
 ## 4. 图片生成下游模板
 
-下游图片生成统一请求目前也按统一字段进入网关：
+下游图片接口：
+
+```http
+POST /v1/images/generations
+POST /v1/images/edits
+Authorization: Bearer sk-your-api-key
+Content-Type: application/json
+```
+
+文生图通常使用 `/v1/images/generations`。图生图可以继续使用该路径，也可以按模型的公开定义使用 `/v1/images/edits`。两个入口都接收相同的统一 JSON 字段；下游插件不直接复刻上游 multipart 或专用字段。
+
+统一请求体：
 
 ```json
 {
@@ -132,22 +143,35 @@ Authorization: Bearer sk-your-api-key
   "size": "16:9",
   "response_format": "url",
   "images": [
-    "base64 或者 https 链接",
-    "base64 或者 https 链接"
+    "base64、data URL 或 HTTPS URL"
   ]
 }
 ```
+
+字段含义：
+
+- `model`：`logical_models.model_name`，下游必须原样发送，不能替换成上游真实模型名。
+- `prompt`：统一图片提示词字段。
+- `quality`：统一质量字段，取值和默认值由逻辑模型定义。
+- `n`：生成数量，取值范围由逻辑模型定义。
+- `size`：统一尺寸字段。它可以表示画幅或像素尺寸，具体语义必须记录在逻辑模型配置或 `logical_models.remark` 中。
+- `response_format`：期望的返回形式，例如 `url` 或 `b64_json`。
+- `images`：图生图参考图，可使用 Base64、data URL 或 HTTPS URL。文生图应省略；没有参考图时不发送空数组。
 
 下游图片返回建议格式：
 
 ```json
 {
   "model": "logical-image-model-name",
-  "url": "base64 或 url"
+  "url": "base64、data URL 或 HTTPS URL"
 }
 ```
 
-新增图片模型时同样遵循统一字段到上游字段的映射原则。若上游是 OpenAI 兼容图片接口，通常映射 `prompt`、`quality`、`n`、`size`、`response_format`、`images` 即可。若上游需要 multipart，则 `req_mapping` 可输出带 `_request_format`、`fields`、`files`、`_file_fields` 的对象，具体以 `server.js` 中 multipart 支持为准。
+图片接口同步返回，不创建视频任务，也不使用轮询流程。映射应优先把结果归一到顶层 `url`；Base64 结果也可归一到顶层 `b64_json`。为兼容 OpenAI 风格调用方，响应还可保留 `data[0].url` 或 `data[0].b64_json`，但不能要求插件只解析未归一的上游结构。
+
+新增图片模型时同样遵循统一字段到上游字段的映射原则。若上游是 OpenAI 兼容图片接口，通常映射 `prompt`、`quality`、`n`、`size`、`response_format`、`images` 即可。若上游需要 multipart，则 `req_mapping` 输出带 `_request_format`、`fields`、`files`、`_file_fields` 的对象，具体以 `server.js` 中 multipart 支持为准。multipart 转换属于网关绑定，不能下放到插件实现。
+
+模型支持文生图还是图生图、参考图数量和大小限制、`size` 取值、质量选项、输出格式及扩展名，都应写入本地模型配置或 `logical_models.remark`，供插件接入时读取。不要把分辨率或任务模式拼接到逻辑模型名中，除非它们本来就是网关公开模型名的一部分。
 
 ## 5. 数据库配置字段
 
@@ -253,7 +277,9 @@ $merge([
 }
 ```
 
-## 7. 新增视频渠道检查清单
+## 7. 新增渠道检查清单
+
+### 7.1 视频渠道
 
 阅读上游文档后，逐项确认：
 
@@ -274,6 +300,22 @@ $merge([
 15. 上游规格限制是什么？如果只能靠映射表达式表达默认值就写进 `req_mapping`；如果需要复杂校验，记录在渠道备注或交给调用方遵守。
 16. 上游成品链接是否需要鉴权？需要时开启绑定的“视频内容访问：网关代理”，公开链接则保持“返回直链”。
 17. 新任务会保存代理开关快照，避免任务生成期间修改绑定配置影响已提交任务；旧任务没有快照时回看当前绑定配置。
+
+### 7.2 图片渠道
+
+阅读上游文档后，逐项确认：
+
+1. 下游公开入口使用 `/v1/images/generations` 还是 `/v1/images/edits`。
+2. 上游完整 URL 如何拆成 `channels.base_url` 和 `model_bindings.route_path`。
+3. 上游鉴权方式及密钥应放在渠道还是绑定中。
+4. 上游真实模型名如何由下游逻辑模型名映射。
+5. 模型支持文生图、图生图还是两者。
+6. `prompt`、`quality`、`n`、`size` 和 `response_format` 分别映射到哪些上游字段。
+7. 参考图是否必填，支持的输入形式、最大数量和大小限制是什么。
+8. 上游是否要求 multipart；需要时由 `req_mapping` 输出网关支持的 multipart 描述对象。
+9. 上游结果是 URL、data URL 还是 Base64，如何通过 `resp_mapping` 归一为顶层 `url` 或 `b64_json`。
+10. 支持的画幅、像素尺寸、质量和输出格式是否已记录在本地配置或 `logical_models.remark`。
+11. 使用构造请求和模拟响应验证映射，不发送可能计费的真实生成请求，除非用户明确授权。
 
 ## 8. Quality V4 示例映射
 
@@ -354,6 +396,7 @@ Quality V4 不支持下游模板中的 `videos` 和 `audios`，因此该绑定�
 - 不要忘记异步提交响应的 `task_id`，否则网关无法保存上游任务号。
 - 不要忘记轮询完成响应的 `video_url`，否则 `/content` 无法拿到视频地址。
 - 不要把上游 `in_progress` 原样返回给下游模板，建议归一为 `processing`。
+- 轮询返回的 `created_at` 必须是 Unix 秒级时间戳（例如 `1789191547`）。上游返回 ISO 时间或毫秒时间时，在 `poll_mapping` 中转换为秒；缺失时可使用当前时间戳。
 - 不要映射上游不支持的媒体字段。
 - 不要把上游文档里的示例 URL、示例 key、示例 prompt 当成生产配置。
 - 如果下游使用网关自有 key，必须在渠道或绑定中配置上游 key，否则上游请求可能没有有效鉴权。

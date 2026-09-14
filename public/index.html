@@ -70,10 +70,11 @@
                     <el-table-column prop="remark" label="备注" show-overflow-tooltip></el-table-column>
                     <el-table-column label="绑定渠道数" width="120"><template #default="scope">{{ scope.row.bindings ? scope.row.bindings.length : 0 }}</template></el-table-column>
                     <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status ? 'success' : 'danger'">{{ scope.row.status ? '启用' : '禁用' }}</el-tag></template></el-table-column>
-                    <el-table-column label="操作" width="180" fixed="right">
+                    <el-table-column label="操作" width="230" fixed="right">
                         <template #default="scope">
                             <el-button size="small" type="primary" link @click="openModelDialog(scope.row)">编辑</el-button>
                             <el-button size="small" type="success" link @click="cloneModel(scope.row)">复制</el-button>
+                            <el-button size="small" type="danger" link @click="deleteModel(scope.row)">删除</el-button>
                         </template>
                     </el-table-column>
                 </el-table>
@@ -88,7 +89,7 @@
                     <el-table-column label="鉴权方式" width="150"><template #default="scope">{{ scope.row.auth_type === 'x-auth-token' ? 'X-Auth-Token' : 'Bearer Token' }}</template></el-table-column>
                     <el-table-column label="默认密钥"><template #default="scope">{{ scope.row.api_key ? '已设置' : '未设置' }}</template></el-table-column>
                     <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status ? 'success' : 'danger'">{{ scope.row.status ? '启用' : '禁用' }}</el-tag></template></el-table-column>
-                    <el-table-column label="操作" width="120" fixed="right"><template #default="scope"><el-button size="small" type="primary" link @click="openChannelDialog(scope.row)">编辑</el-button></template></el-table-column>
+                    <el-table-column label="操作" width="180" fixed="right"><template #default="scope"><el-button size="small" type="primary" link @click="openChannelDialog(scope.row)">编辑</el-button><el-button size="small" type="danger" link @click="deleteChannel(scope.row)">删除</el-button></template></el-table-column>
                 </el-table>
             </div>
 
@@ -100,7 +101,7 @@
                     <el-table-column label="总额度" width="120"><template #default="scope"><el-tag v-if="scope.row.quota < 0" type="warning">不限</el-tag><span v-else>{{ scope.row.quota }}</span></template></el-table-column>
                     <el-table-column prop="used_quota" label="已用额度"></el-table-column>
                     <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status ? 'success' : 'danger'">{{ scope.row.status ? '正常' : '已禁用' }}</el-tag></template></el-table-column>
-                    <el-table-column label="操作" width="120" fixed="right"><template #default="scope"><el-button size="small" type="primary" link @click="openKeyDialog(scope.row)">编辑/充值</el-button></template></el-table-column>
+                    <el-table-column label="操作" width="180" fixed="right"><template #default="scope"><el-button size="small" type="primary" link @click="openKeyDialog(scope.row)">编辑/充值</el-button><el-button size="small" type="danger" link @click="deleteKey(scope.row)">删除</el-button></template></el-table-column>
                 </el-table>
             </div>
 
@@ -203,7 +204,7 @@ const app = createApp({
                 });
                 const data = await res.json();
                 if (res.status === 401) { ElementPlus.ElMessage.warning("会话已过期，请重新登录"); logout(); return null; }
-                if (res.status !== 200) { ElementPlus.ElMessage.error(data.error || "请求失败"); return null; }
+                if (res.status < 200 || res.status >= 300) { ElementPlus.ElMessage.error(data.error || "请求失败"); return null; }
                 return data;
             } catch (e) { ElementPlus.ElMessage.error("网络请求异常"); return null; }
         }
@@ -303,6 +304,14 @@ const app = createApp({
             if (res && res.success) { ElementPlus.ElMessage.success("保存成功"); dialogVisible.value = false; fetchData(); }
         }
 
+        async function deleteModel(row) {
+            try {
+                await ElementPlus.ElMessageBox.confirm(`确定删除模型“${row.model_name}”吗？删除后模型将被禁用并保留历史任务记录。`, "删除模型", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+            } catch (e) { return; }
+            const res = await requestApi(`/models/${row.id}`, "DELETE");
+            if (res && res.success) { ElementPlus.ElMessage.success("模型已删除"); await fetchData(); }
+        }
+
         function openChannelDialog(row = null) { channelForm.value = row ? { auth_type: "bearer", ...JSON.parse(JSON.stringify(row)) } : { status: 1, auth_type: "bearer" }; channelDialogVisible.value = true; }
         async function saveChannel() {
             if (!channelForm.value.name || !channelForm.value.base_url) return ElementPlus.ElMessage.warning("名称和URL不能为空");
@@ -310,6 +319,14 @@ const app = createApp({
             const path = channelForm.value.id ? `/channels/${channelForm.value.id}` : "/channels";
             const res = await requestApi(path, method, channelForm.value);
             if (res && res.success) { ElementPlus.ElMessage.success("保存成功"); channelDialogVisible.value = false; fetchData(); }
+        }
+
+        async function deleteChannel(row) {
+            try {
+                await ElementPlus.ElMessageBox.confirm(`确定删除渠道“${row.name}”吗？删除后渠道将被禁用并保留历史任务记录。`, "删除渠道", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+            } catch (e) { return; }
+            const res = await requestApi(`/channels/${row.id}`, "DELETE");
+            if (res && res.success) { ElementPlus.ElMessage.success("渠道已删除"); await fetchData(); }
         }
 
         function generateKeyString() { keyForm.value.api_key = "sk-" + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15); }
@@ -330,12 +347,20 @@ const app = createApp({
             if (res && res.success) { ElementPlus.ElMessage.success("保存成功"); keyDialogVisible.value = false; fetchData(); }
         }
 
+        async function deleteKey(row) {
+            try {
+                await ElementPlus.ElMessageBox.confirm(`确定删除网关密钥“${row.api_key}”吗？删除后密钥将不能继续使用。`, "删除网关密钥", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+            } catch (e) { return; }
+            const res = await requestApi(`/keys/${row.id}`, "DELETE");
+            if (res && res.success) { ElementPlus.ElMessage.success("网关密钥已删除"); await fetchData(); }
+        }
+
         return {
             isLoggedIn, activeTab, loading, loginForm, login, logout, handleSelect,
-            models, channels, keys, dialogVisible, dialogForm, openModelDialog, saveModel, cloneModel,
+            models, channels, keys, dialogVisible, dialogForm, openModelDialog, saveModel, cloneModel, deleteModel,
             addBinding, cloneBinding, removeBinding, channelName,
-            channelDialogVisible, channelForm, openChannelDialog, saveChannel,
-            keyDialogVisible, keyForm, openKeyDialog, saveKey, generateKeyString, onUnlimitedChange
+            channelDialogVisible, channelForm, openChannelDialog, saveChannel, deleteChannel,
+            keyDialogVisible, keyForm, openKeyDialog, saveKey, deleteKey, generateKeyString, onUnlimitedChange
         };
     }
 });

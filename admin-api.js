@@ -81,6 +81,19 @@ module.exports = function(db) {
         } catch (e) { res.status(500).json({ error: e.message }); }
     });
 
+    router.delete("/channels/:id", adminAuth, async (req, res) => {
+        try {
+            const channel = await db.get("SELECT id, status FROM channels WHERE id = ?", [req.params.id]);
+            if (!channel) return res.status(404).json({ error: "渠道不存在" });
+            const bindings = await db.get("SELECT COUNT(*) AS count FROM model_bindings WHERE channel_id = ? AND status = 1", [req.params.id]);
+            if (Number(bindings && bindings.count) > 0) {
+                return res.status(409).json({ error: "渠道仍有启用中的模型绑定，请先删除或禁用绑定" });
+            }
+            await db.run("UPDATE channels SET status=0 WHERE id=?", [req.params.id]);
+            res.json({ success: true, status: 0 });
+        } catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
     router.get("/models", adminAuth, async (req, res) => {
         try {
             const models = await db.all("SELECT * FROM logical_models ORDER BY id");
@@ -127,6 +140,21 @@ module.exports = function(db) {
                 }
             }
             res.json({ success: true });
+        } catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    router.delete("/models/:id", adminAuth, async (req, res) => {
+        try {
+            const model = await db.get("SELECT id, status FROM logical_models WHERE id = ?", [req.params.id]);
+            if (!model) return res.status(404).json({ error: "模型不存在" });
+            const tasks = await db.get(`SELECT COUNT(*) AS count FROM async_tasks
+                WHERE logical_model_id = ?
+                  AND (status IS NULL OR status NOT IN ('completed', 'succeeded', 'success', 'done', 'finished', 'failed', 'rejected', 'error', 'cancelled', 'canceled'))`, [req.params.id]);
+            if (Number(tasks && tasks.count) > 0) {
+                return res.status(409).json({ error: "模型存在进行中的任务，请等待任务完成后再删除" });
+            }
+            await db.run("UPDATE logical_models SET status=0 WHERE id=?", [req.params.id]);
+            res.json({ success: true, status: 0 });
         } catch (e) { res.status(500).json({ error: e.message }); }
     });
 
@@ -179,6 +207,21 @@ module.exports = function(db) {
         try {
             await db.run("UPDATE gateway_keys SET quota=?, status=? WHERE id=?", [quota, status !== undefined ? status : 1, req.params.id]);
             res.json({ success: true });
+        } catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    router.delete("/keys/:id", adminAuth, async (req, res) => {
+        try {
+            const key = await db.get("SELECT id, status FROM gateway_keys WHERE id = ?", [req.params.id]);
+            if (!key) return res.status(404).json({ error: "网关密钥不存在" });
+            const tasks = await db.get(`SELECT COUNT(*) AS count FROM async_tasks
+                WHERE gw_key_id = ?
+                  AND (status IS NULL OR status NOT IN ('completed', 'succeeded', 'success', 'done', 'finished', 'failed', 'rejected', 'error', 'cancelled', 'canceled'))`, [req.params.id]);
+            if (Number(tasks && tasks.count) > 0) {
+                return res.status(409).json({ error: "网关密钥仍有关联中的任务，请等待任务完成后再删除" });
+            }
+            await db.run("UPDATE gateway_keys SET status=0 WHERE id=?", [req.params.id]);
+            res.json({ success: true, status: 0 });
         } catch (e) { res.status(500).json({ error: e.message }); }
     });
 

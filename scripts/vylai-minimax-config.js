@@ -39,7 +39,7 @@ const bindings = templates.map(template => ({
         "video_url": data.result_oss_url,
         "object": $state = "completed" ? data.result_oss_url : "video.generation",
         "model": "${template.name}",
-        "created_at": data.created_at,
+        "created_at": ($exists(data.created_at) ? ($type(data.created_at) = "number" ? (data.created_at > 100000000000 ? $floor(data.created_at / 1000) : data.created_at) : $floor($toMillis(data.created_at) / 1000)) : $floor($millis() / 1000)),
         "error": $exists(data.error) ? data.error : ($exists(data.error_message) ? data.error_message : ($state = "failed" ? ($exists(data.msg) ? data.msg : ($exists(msg) ? msg : $status)) : null))
       }
     )`
