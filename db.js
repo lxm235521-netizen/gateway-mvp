@@ -56,6 +56,7 @@ async function addColumnIfMissing(tableName, columnName, definition) {
 
 async function migrate() {
     await addColumnIfMissing("channels", "auth_type", "VARCHAR(32) NOT NULL DEFAULT 'bearer'");
+    await addColumnIfMissing("channels", "convert_base64_to_url", "TINYINT NOT NULL DEFAULT 0");
     await addColumnIfMissing("async_tasks", "upstream_auth_type_snapshot", "VARCHAR(32) NULL");
     await run(`CREATE TABLE IF NOT EXISTS logical_models (
         id INT AUTO_INCREMENT PRIMARY KEY,

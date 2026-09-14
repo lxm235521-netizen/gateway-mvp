@@ -196,6 +196,32 @@ function parseDataUrl(source) {
     };
 }
 
+async function uploadBase64Image(source) {
+    const parsed = parseDataUrl(source);
+    if (!parsed) return source;
+    const form = new FormData();
+    form.append("file", parsed.buffer, { filename: `image.${getFileExtension(parsed.contentType)}`, contentType: parsed.contentType });
+    const response = await axios.post("https://wgspai.cn/image-bed/api/upload", form, {
+        headers: form.getHeaders(), maxContentLength: Infinity, maxBodyLength: Infinity
+    });
+    if (!response.data || response.data.success !== true || !response.data.url) {
+        throw new Error("Image upload failed: invalid response");
+    }
+    return response.data.url;
+}
+
+async function convertBase64Images(value) {
+    if (typeof value === "string") {
+        return /^data:image\//i.test(value) ? await uploadBase64Image(value) : value;
+    }
+    if (Array.isArray(value)) return Promise.all(value.map(convertBase64Images));
+    if (isObject(value)) {
+        const entries = await Promise.all(Object.entries(value).map(async ([key, item]) => [key, await convertBase64Images(item)]));
+        return Object.fromEntries(entries);
+    }
+    return value;
+}
+
 async function appendFilePart(form, field, fileSpec, index = 0) {
     const spec = isObject(fileSpec) ? fileSpec : { source: fileSpec };
     const source = spec.source || spec.url || spec.base64 || spec.data;
@@ -322,6 +348,7 @@ async function loadActiveBindings(modelName) {
             c.base_url,
             c.api_key AS channel_api_key,
             c.auth_type AS channel_auth_type,
+            c.convert_base64_to_url,
             c.name AS channel_name
         FROM logical_models lm
         JOIN model_bindings b ON b.logical_model_id = lm.id
@@ -361,7 +388,8 @@ function tryPassthroughUpstreamError(res, error, passthrough) {
 }
 
 async function sendMappedPost(binding, body, logLabel, options = {}) {
-    const upstreamPayload = await executeMapping(binding.req_mapping, body);
+    const inputBody = binding.convert_base64_to_url ? await convertBase64Images(body) : body;
+    const upstreamPayload = await executeMapping(binding.req_mapping, inputBody);
     const upstreamKey = options.upstreamKey || binding.api_key || binding.channel_api_key;
     const upstreamUrl = resolveUpstreamUrl(binding, upstreamPayload);
 

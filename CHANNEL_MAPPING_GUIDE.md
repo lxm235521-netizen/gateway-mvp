@@ -181,6 +181,7 @@ Content-Type: application/json
 - `base_url`：上游基础地址，不含具体接口路径时最好不要以多余路径结尾。例如上游完整地址是 `https://example.com/v1/videos`，则 `base_url` 可填 `https://example.com/v1`，`route_path` 填 `/videos`。
 - `api_key`：上游固定密钥。若为空，网关会尝试使用下游传入的 Bearer key 透传给上游。
 - `status`：`1` 启用，`0` 禁用。
+- `convert_base64_to_url`：`1` 时，提交到该渠道前会将请求体中 `data:image/...;base64,...` 图片上传到 `https://wgspai.cn/image-bed/api/upload`，并替换为返回的 HTTPS URL；`0` 保持原样。
 
 ### logical_models
 

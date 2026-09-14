@@ -58,25 +58,25 @@ module.exports = function(db) {
     });
 
     router.post("/channels", adminAuth, async (req, res) => {
-        const { name, base_url, api_key, status } = req.body;
+        const { name, base_url, api_key, status, convert_base64_to_url } = req.body;
         let authType;
         try { authType = normalizeAuthType(req.body.auth_type); }
         catch (e) { return res.status(400).json({ error: e.message }); }
         try {
-            await db.run("INSERT INTO channels (name, base_url, api_key, status, auth_type) VALUES (?, ?, ?, ?, ?)", [name, base_url, api_key || null, status !== undefined ? status : 1, authType]);
+            await db.run("INSERT INTO channels (name, base_url, api_key, status, auth_type, convert_base64_to_url) VALUES (?, ?, ?, ?, ?, ?)", [name, base_url, api_key || null, status !== undefined ? status : 1, authType, convert_base64_to_url ? 1 : 0]);
             res.json({ success: true });
         } catch (e) { res.status(500).json({ error: e.message }); }
     });
 
     router.put("/channels/:id", adminAuth, async (req, res) => {
-        const { name, base_url, api_key, status } = req.body;
+        const { name, base_url, api_key, status, convert_base64_to_url } = req.body;
         let authType = null;
         if (req.body.auth_type !== undefined) {
             try { authType = normalizeAuthType(req.body.auth_type); }
             catch (e) { return res.status(400).json({ error: e.message }); }
         }
         try {
-            await db.run("UPDATE channels SET name=?, base_url=?, api_key=?, status=?, auth_type=COALESCE(?, auth_type) WHERE id=?", [name, base_url, api_key || null, status !== undefined ? status : 1, authType, req.params.id]);
+            await db.run("UPDATE channels SET name=?, base_url=?, api_key=?, status=?, auth_type=COALESCE(?, auth_type), convert_base64_to_url=COALESCE(?, convert_base64_to_url) WHERE id=?", [name, base_url, api_key || null, status !== undefined ? status : 1, authType, convert_base64_to_url === undefined ? null : (convert_base64_to_url ? 1 : 0), req.params.id]);
             res.json({ success: true });
         } catch (e) { res.status(500).json({ error: e.message }); }
     });

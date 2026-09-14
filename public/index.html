@@ -155,6 +155,7 @@
                     <el-form-item label="上游 BaseURL"><el-input v-model="channelForm.base_url"></el-input></el-form-item>
                     <el-form-item label="渠道默认密钥"><el-input v-model="channelForm.api_key" show-password></el-input></el-form-item>
                     <el-form-item label="上游鉴权方式"><el-select v-model="channelForm.auth_type" style="width:100%"><el-option label="Bearer Token" value="bearer"></el-option><el-option label="X-Auth-Token" value="x-auth-token"></el-option></el-select></el-form-item>
+                    <el-form-item label="图片 Base64 转 HTTPS"><el-switch v-model="channelForm.convert_base64_to_url" :active-value="1" :inactive-value="0"></el-switch><span style="margin-left:8px;color:#909399">上传到 image.wgspai.cn 后再发送给上游</span></el-form-item>
                     <el-form-item label="是否启用"><el-switch v-model="channelForm.status" :active-value="1" :inactive-value="0"></el-switch></el-form-item>
                 </el-form>
                 <template #footer><el-button @click="channelDialogVisible = false">取消</el-button><el-button type="primary" @click="saveChannel">保存渠道</el-button></template>
@@ -312,7 +313,7 @@ const app = createApp({
             if (res && res.success) { ElementPlus.ElMessage.success("模型已删除"); await fetchData(); }
         }
 
-        function openChannelDialog(row = null) { channelForm.value = row ? { auth_type: "bearer", ...JSON.parse(JSON.stringify(row)) } : { status: 1, auth_type: "bearer" }; channelDialogVisible.value = true; }
+        function openChannelDialog(row = null) { channelForm.value = row ? { auth_type: "bearer", convert_base64_to_url: 0, ...JSON.parse(JSON.stringify(row)) } : { status: 1, auth_type: "bearer", convert_base64_to_url: 0 }; channelDialogVisible.value = true; }
         async function saveChannel() {
             if (!channelForm.value.name || !channelForm.value.base_url) return ElementPlus.ElMessage.warning("名称和URL不能为空");
             const method = channelForm.value.id ? "PUT" : "POST";

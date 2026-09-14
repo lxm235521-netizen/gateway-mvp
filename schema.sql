@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS channels (
     base_url VARCHAR(1024) NOT NULL,
     api_key TEXT,
     auth_type VARCHAR(32) NOT NULL DEFAULT 'bearer',
+    convert_base64_to_url TINYINT NOT NULL DEFAULT 0,
     status TINYINT DEFAULT 1
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
