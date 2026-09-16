@@ -58,9 +58,18 @@ function normalizeBinding(binding) {
 
 const DEFAULT_OPTIMIZER_MODEL = "h3-prompt-writing";
 const DEFAULT_OPTIMIZER_TIMEOUT_MS = 120000;
-// The optimizer service caps concurrency per account; the gateway queues instead
-// of firing every request at once. This is a global-only knob.
-const DEFAULT_OPTIMIZER_CONCURRENCY = 2;
+// The optimizer throttles per account when a burst lands at once; the gateway
+// queues instead. These two are global-only knobs.
+const DEFAULT_OPTIMIZER_CONCURRENCY = 8;
+const DEFAULT_OPTIMIZER_QUEUE_WAIT_MS = 300000;
+
+function clampInt(value, fallback, min, max) {
+    const raw = Number(value);
+    if (!Number.isFinite(raw) || raw <= 0) {
+        return fallback;
+    }
+    return Math.min(Math.max(Math.trunc(raw), min), max);
+}
 
 // Accepts "image,video", "image video" and casing variants.
 function normalizeOptimizerMediaKinds(value) {
@@ -109,10 +118,8 @@ async function writeOptimizerDefaults(db, body) {
         normalized.optimizer_api_key = (existing && existing.optimizer_api_key) || null;
     }
     normalized.enabled = body.enabled ? 1 : 0;
-    const concurrency = Number(body.optimizer_concurrency);
-    normalized.optimizer_concurrency = Number.isFinite(concurrency) && concurrency > 0
-        ? Math.min(Math.max(Math.trunc(concurrency), 1), 32)
-        : DEFAULT_OPTIMIZER_CONCURRENCY;
+    normalized.optimizer_concurrency = clampInt(body.optimizer_concurrency, DEFAULT_OPTIMIZER_CONCURRENCY, 1, 64);
+    normalized.optimizer_queue_wait_ms = clampInt(body.optimizer_queue_wait_ms, DEFAULT_OPTIMIZER_QUEUE_WAIT_MS, 10000, 3600000);
     await persistOptimizerDefaults(db, normalized);
     return normalized;
 }
@@ -134,6 +141,10 @@ function buildOptimizerTestConfig(defaults, body) {
     config.optimizer_concurrency = Number.isFinite(concurrency) && concurrency > 0
         ? Math.trunc(concurrency)
         : (global.optimizer_concurrency || DEFAULT_OPTIMIZER_CONCURRENCY);
+    const queueWait = Number(body && body.optimizer_queue_wait_ms);
+    config.optimizer_queue_wait_ms = Number.isFinite(queueWait) && queueWait > 0
+        ? Math.trunc(queueWait)
+        : (global.optimizer_queue_wait_ms || DEFAULT_OPTIMIZER_QUEUE_WAIT_MS);
     config.optimize_prompt = 1;
     config.optimizer_model = config.optimizer_model || DEFAULT_OPTIMIZER_MODEL;
     config.optimizer_timeout_ms = config.optimizer_timeout_ms || DEFAULT_OPTIMIZER_TIMEOUT_MS;

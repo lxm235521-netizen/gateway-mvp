@@ -204,49 +204,76 @@ function isInsecureHttpAllowed(config) {
     return value === 1 || value === true || value === "1";
 }
 
-// The optimizer account has a concurrency cap, so firing every incoming request
-// at it in parallel makes the service reject the extras. Requests are queued
-// instead, and the wait is bounded so a backed-up queue falls back rather than
-// holding the caller's generation open indefinitely.
-const DEFAULT_OPTIMIZER_CONCURRENCY = 2;
-const MAX_QUEUE_WAIT_MS = 180000;
+// The optimizer throttles per account when too many requests land at once, so
+// requests are queued rather than all fired in parallel. The limit is generous by
+// default because the queue itself is the risk: every request stuck behind it
+// waits, and one that waits past optimizer_queue_wait_ms falls back. Raise
+// concurrency to match real throughput, lower it only if the optimizer starts
+// rejecting with "Concurrency limit exceeded".
+const DEFAULT_OPTIMIZER_CONCURRENCY = 8;
+const DEFAULT_QUEUE_WAIT_MS = 300000;
+const MAX_QUEUE_WAIT_MS = 3600000;
 
-const optimizerQueue = [];
+// Depth per configured concurrency value, so a model with its own concurrency
+// cannot be throttled by whatever value another request happened to set.
+const optimizerQueues = new Map();
 let activeOptimizerCalls = 0;
-let optimizerQueueLimit = DEFAULT_OPTIMIZER_CONCURRENCY;
 
 function resolveConcurrency(config) {
     const raw = Number(config && config.optimizer_concurrency);
     if (!Number.isFinite(raw) || raw <= 0) {
         return DEFAULT_OPTIMIZER_CONCURRENCY;
     }
-    return Math.min(Math.max(Math.trunc(raw), 1), 32);
+    return Math.min(Math.max(Math.trunc(raw), 1), 64);
 }
 
-function pumpOptimizerQueue() {
-    while (activeOptimizerCalls < optimizerQueueLimit && optimizerQueue.length > 0) {
-        const job = optimizerQueue.shift();
-        if (Date.now() - job.enqueuedAt > MAX_QUEUE_WAIT_MS) {
-            job.reject(new Error("提示词优化排队超时"));
-            continue;
+function resolveQueueWaitMs(config) {
+    const raw = Number(config && config.optimizer_queue_wait_ms);
+    if (!Number.isFinite(raw) || raw <= 0) {
+        return DEFAULT_QUEUE_WAIT_MS;
+    }
+    return Math.min(Math.max(Math.trunc(raw), 10000), MAX_QUEUE_WAIT_MS);
+}
+
+// Effective in-flight limit: the largest concurrency any waiting request asked
+// for, so one model's low setting cannot throttle another's high setting while
+// the total still stays bounded.
+function effectiveLimit() {
+    let limit = 0;
+    for (const value of optimizerQueues.keys()) {
+        limit = Math.max(limit, value);
+    }
+    return limit;
+}
+
+function pumpOptimizerQueues() {
+    for (const [limit, queue] of optimizerQueues) {
+        while (queue.length > 0 && activeOptimizerCalls < effectiveLimit() && activeOptimizerCalls < limit) {
+            const job = queue.shift();
+            if (Date.now() - job.enqueuedAt > job.maxWaitMs) {
+                job.reject(new Error("提示词优化排队超时"));
+                continue;
+            }
+            activeOptimizerCalls += 1;
+            job.run()
+                .then(job.resolve, job.reject)
+                .finally(() => {
+                    activeOptimizerCalls -= 1;
+                    pumpOptimizerQueues();
+                });
         }
-        activeOptimizerCalls += 1;
-        job.run()
-            .then(job.resolve, job.reject)
-            .finally(() => {
-                activeOptimizerCalls -= 1;
-                pumpOptimizerQueue();
-            });
     }
 }
 
 // Runs `task` once a slot is free. Resolves the same way task() would.
 // onStart receives how long the job waited in the queue.
-function runQueued(task, limit, onStart) {
-    optimizerQueueLimit = limit;
+function runQueued(task, limit, maxWaitMs, onStart) {
     return new Promise((resolve, reject) => {
+        if (!optimizerQueues.has(limit)) {
+            optimizerQueues.set(limit, []);
+        }
         const enqueuedAt = Date.now();
-        optimizerQueue.push({
+        optimizerQueues.get(limit).push({
             run: () => {
                 if (onStart) {
                     onStart(Date.now() - enqueuedAt);
@@ -255,17 +282,17 @@ function runQueued(task, limit, onStart) {
             },
             resolve,
             reject,
-            enqueuedAt
+            enqueuedAt,
+            maxWaitMs
         });
-        pumpOptimizerQueue();
+        pumpOptimizerQueues();
     });
 }
 
 // Exposed for tests so queue state can be reset between cases.
 function resetOptimizerQueue() {
-    optimizerQueue.length = 0;
+    optimizerQueues.clear();
     activeOptimizerCalls = 0;
-    optimizerQueueLimit = DEFAULT_OPTIMIZER_CONCURRENCY;
 }
 
 // Some optimizer deployments wrap a saturated upstream as HTTP 502 whose body
@@ -305,7 +332,7 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function requestWithConcurrencyRetry(url, body, options, model, concurrency, onStart) {
+async function requestWithConcurrencyRetry(url, body, options, model, concurrency, maxWaitMs, onStart) {
     return runQueued(async () => {
         let attempt = 0;
         for (;;) {
@@ -325,7 +352,7 @@ async function requestWithConcurrencyRetry(url, body, options, model, concurrenc
                 await sleep(waitMs);
             }
         }
-    }, concurrency, onStart);
+    }, concurrency, maxWaitMs, onStart);
 }
 
 // Connection settings that a model may inherit from the saved global defaults.
@@ -488,13 +515,14 @@ async function optimizeWithConfig(payload, config) {
 
         console.log(`[Prompt Optimizer] ${model} via ${endpoint} (images=${images.length}, json=${jsonMode}, timeout=${timeoutMs}ms)`);
         const queueSlot = resolveConcurrency(effective);
+        const queueWaitLimitMs = resolveQueueWaitMs(effective);
         let queueWaitMs = 0;
         const response = await requestWithConcurrencyRetry(endpoint, requestBody, {
             headers: buildOptimizerHeaders(apiKey, endpoint, allowInsecureHttp),
             timeout: timeoutMs,
             maxContentLength: Infinity,
             maxBodyLength: Infinity
-        }, model, queueSlot, wait => { queueWaitMs = wait; });
+        }, model, queueSlot, queueWaitLimitMs, wait => { queueWaitMs = wait; });
 
         const optimized = parseOptimizerResponse(response.data);
         if (!optimized) {
@@ -565,10 +593,12 @@ module.exports = {
     parseMediaKinds,
     resolveTimeout,
     resolveConcurrency,
+    resolveQueueWaitMs,
     GLOBAL_OPTIMIZER_FIELDS,
     DEFAULT_MODEL,
     DEFAULT_BASE_URL,
     DEFAULT_TIMEOUT_MS,
     DEFAULT_MEDIA_BYTES,
-    DEFAULT_OPTIMIZER_CONCURRENCY
+    DEFAULT_OPTIMIZER_CONCURRENCY,
+    DEFAULT_QUEUE_WAIT_MS
 };

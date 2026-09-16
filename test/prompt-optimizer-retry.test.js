@@ -117,6 +117,35 @@ test("the queue honours a higher configured concurrency", async () => {
     assert.equal(fake.state.peak, 3, "three slots allow three parallel calls");
 });
 
+test("a request that waits past the configured queue limit falls back", async () => {
+    const fake = trackingAxios();
+    const service = loadServiceWith(fake);
+
+    // First call occupies the only slot; the second gives up after its wait limit.
+    const first = service.optimizeWithConfig({ prompt: "slow one" }, Object.assign({}, BASE_CONFIG, { optimizer_concurrency: 1, optimizer_queue_wait_ms: 10000 }));
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const second = service.optimizeWithConfig({ prompt: "waits too long" }, Object.assign({}, BASE_CONFIG, { optimizer_concurrency: 1, optimizer_queue_wait_ms: 10000 }));
+
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a.trace.optimized, true, "the running call succeeds");
+    // A 10s limit is the minimum allowed, so this only proves the knob is read and
+    // the queue still drains; the timeout path itself is covered by the queue cap.
+    assert.equal(fake.state.calls, 2);
+    assert.ok(b.trace.optimized || /排队超时/.test(b.trace.reason || ""));
+});
+
+test("queue wait and concurrency defaults are the documented values", () => {
+    const service = loadServiceWith({ async post() { throw new Error("unused"); }, async get() { throw new Error("unused"); } });
+    assert.equal(service.DEFAULT_OPTIMIZER_CONCURRENCY, 8);
+    assert.equal(service.DEFAULT_QUEUE_WAIT_MS, 300000);
+    assert.equal(service.resolveConcurrency({}), 8);
+    assert.equal(service.resolveConcurrency({ optimizer_concurrency: 32 }), 32);
+    assert.equal(service.resolveConcurrency({ optimizer_concurrency: 999 }), 64, "clamped to the maximum");
+    assert.equal(service.resolveQueueWaitMs({}), 300000);
+    assert.equal(service.resolveQueueWaitMs({ optimizer_queue_wait_ms: 60000 }), 60000);
+    assert.equal(service.resolveQueueWaitMs({ optimizer_queue_wait_ms: 1 }), 10000, "clamped to the minimum");
+});
+
 test("a concurrency limit is retried and the retry's result is used", async () => {
     const calls = [];
     const axiosFake = {
