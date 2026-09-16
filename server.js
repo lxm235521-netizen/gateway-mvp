@@ -7,6 +7,7 @@ const path = require("path");
 const crypto = require("crypto");
 const db = require("./db");
 const { buildAuthHeaders } = require("./upstream-auth");
+const { optimizeRequestPayload, toMeta } = require("./prompt-optimizer-service");
 
 const app = express();
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "50mb" }));
@@ -28,7 +29,7 @@ const MULTIPART_META_KEYS = new Set([
 
 const adminRouter = require("./admin-api")(db);
 app.use("/admin", adminRouter);
-
+const { ensureSettingsTable, readOptimizerDefaults } = require("./gateway-settings");
 app.get("/healthz", async (req, res) => {
     try {
         await db.get("SELECT 1 AS ok");
@@ -350,6 +351,16 @@ async function loadActiveBindings(modelName) {
             b.id AS binding_id,
             lm.id AS logical_model_id,
             lm.model_name,
+            lm.optimize_prompt,
+            lm.optimizer_base_url,
+            lm.optimizer_api_key,
+            lm.optimizer_model,
+            lm.optimizer_system_prompt,
+            lm.optimizer_json_mode,
+            lm.optimizer_timeout_ms,
+            lm.optimizer_send_media,
+            lm.optimizer_allow_http,
+            lm.optimizer_debug,
             c.base_url,
             c.api_key AS channel_api_key,
             c.auth_type AS channel_auth_type,
@@ -392,8 +403,28 @@ function tryPassthroughUpstreamError(res, error, passthrough) {
     return false;
 }
 
+function isOptimizerDebugEnabled(binding) {
+    return Boolean(binding && Number(binding.optimizer_debug) === 1);
+}
+
+// The saved global optimizer defaults are merged into each request so a model
+// only needs to switch the feature on when the connection is configured globally.
+// Read failure must never break a request, so it degrades to model-only settings.
+async function loadGlobalOptimizerDefaults() {
+    try {
+        return await readOptimizerDefaults(db);
+    } catch (error) {
+        console.error("[Prompt Optimizer] failed to read global defaults:", error.message);
+        return {};
+    }
+}
+
 async function sendMappedPost(binding, body, logLabel, options = {}) {
-    const inputBody = binding.convert_base64_to_url ? await convertBase64Images(body) : body;
+    // Prompt optimization runs on the caller's original body so the optimizer
+    // receives inline image data, before any channel-level base64 -> URL upload.
+    const globalDefaults = await loadGlobalOptimizerDefaults();
+    const { payload, trace } = await optimizeRequestPayload(body, binding, globalDefaults);
+    const inputBody = binding.convert_base64_to_url ? await convertBase64Images(payload) : payload;
     const upstreamPayload = await executeMapping(binding.req_mapping, inputBody);
     const upstreamKey = options.upstreamKey || binding.api_key || binding.channel_api_key;
     const upstreamUrl = resolveUpstreamUrl(binding, upstreamPayload);
@@ -403,7 +434,22 @@ async function sendMappedPost(binding, body, logLabel, options = {}) {
     const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
     const gwResponse = await executeMapping(binding.resp_mapping, upstreamRes.data);
 
-    return { gwResponse, upstreamKey };
+    return { gwResponse, upstreamKey, optimizerTrace: trace };
+}
+
+// The optimizer trace is only reported to callers when the model enables debug,
+// or when the step was enabled but could not run (so failures are discoverable).
+function attachOptimizerDebug(responseBody, binding, trace) {
+    if (!trace || !trace.enabled) {
+        return responseBody;
+    }
+    if (!isOptimizerDebugEnabled(binding) && trace.optimized) {
+        return responseBody;
+    }
+    const current = isObject(responseBody) && isObject(responseBody.prompt_optimizer)
+        ? responseBody.prompt_optimizer
+        : null;
+    return { ...responseBody, prompt_optimizer: current || toMeta(trace) };
 }
 
 async function loadLegacyPollRuntime(taskRecord) {
@@ -628,10 +674,10 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
         if (req.gatewayKey) {
             await db.run('UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?', [req.gatewayKey.id]);
         }
-        const { gwResponse } = await sendMappedPost(binding, req.body, "Gateway POST completions", {
+        const { gwResponse, optimizerTrace } = await sendMappedPost(binding, req.body, "Gateway POST completions", {
             upstreamKey: req.passThroughKey
         });
-        return res.json(gwResponse);
+        return res.json(attachOptimizerDebug(gwResponse, binding, optimizerTrace));
     } catch (error) {
         if (tryPassthroughUpstreamError(res, error, binding && binding.error_passthrough)) return;
         console.error("[Gateway POST completions Error]", error.response ? error.response.data : error.message);
@@ -647,13 +693,13 @@ app.post(["/v1/images/generations", "/v1/images/edits"], authMiddleware, async (
             return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
 
-        const { gwResponse } = await sendMappedPost(binding, req.body, "Gateway POST images", {
+        const { gwResponse, optimizerTrace } = await sendMappedPost(binding, req.body, "Gateway POST images", {
             upstreamKey: req.passThroughKey
         });
         if (req.gatewayKey) {
             await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
         }
-        return res.json(gwResponse);
+        return res.json(attachOptimizerDebug(gwResponse, binding, optimizerTrace));
     } catch (error) {
         if (tryPassthroughUpstreamError(res, error, binding && binding.error_passthrough)) return;
         console.error("[Gateway POST Images Error]", error.response ? error.response.data : error.message);
@@ -669,11 +715,11 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
             return res.status(503).json({ error: "Model not found, disabled, or has no available channel" });
         }
 
-        const { gwResponse, upstreamKey } = await sendMappedPost(binding, req.body, "Gateway POST videos", {
+        const { gwResponse, upstreamKey, optimizerTrace } = await sendMappedPost(binding, req.body, "Gateway POST videos", {
             upstreamKey: req.passThroughKey
         });
         if (!binding.is_async) {
-            return res.json(gwResponse);
+            return res.json(attachOptimizerDebug(gwResponse, binding, optimizerTrace));
         }
 
         const upTaskId = gwResponse.task_id;
@@ -685,8 +731,9 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
         await db.run(`INSERT INTO async_tasks (
                 gw_task_id, up_task_id, gw_key_id, model_id, logical_model_id, binding_id, channel_id,
                 upstream_base_url, poll_path_snapshot, poll_mapping_snapshot, upstream_api_key_snapshot,
-                proxy_content_snapshot, poll_throttle_snapshot, upstream_auth_type_snapshot
-            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                proxy_content_snapshot, poll_throttle_snapshot, upstream_auth_type_snapshot,
+                original_prompt, optimized_prompt, prompt_optimizer_meta
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             gwTaskId,
             upTaskId,
             req.gatewayKey ? req.gatewayKey.id : null,
@@ -699,20 +746,23 @@ app.post("/v1/videos", authMiddleware, async (req, res) => {
             upstreamKey,
             binding.proxy_content ? 1 : 0,
             binding.poll_throttle ? 1 : 0,
-            binding.channel_auth_type || "bearer"
+            binding.channel_auth_type || "bearer",
+            optimizerTrace && optimizerTrace.original_prompt ? optimizerTrace.original_prompt : null,
+            optimizerTrace && optimizerTrace.optimized_prompt ? optimizerTrace.optimized_prompt : null,
+            optimizerTrace && optimizerTrace.enabled ? JSON.stringify(toMeta(optimizerTrace)) : null
         ]);
         if (req.gatewayKey) {
             await db.run("UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?", [req.gatewayKey.id]);
         }
 
-        return res.json({
+        return res.json(attachOptimizerDebug({
             id: gwTaskId,
             task_id: gwTaskId,
             model: binding.model_name,
             status: "queued",
             progress: 0,
             created_at: Math.floor(Date.now() / 1000)
-        });
+        }, binding, optimizerTrace));
     } catch (error) {
         if (tryPassthroughUpstreamError(res, error, binding && binding.error_passthrough)) return;
         console.error("[Gateway POST videos Error]", error.response ? error.response.data : error.message);
@@ -787,6 +837,7 @@ const port = Number(process.env.PORT || 3000);
 async function start() {
     await db.waitForConnection();
     await db.migrate();
+    await ensureSettingsTable(db);
     app.listen(port, () => {
         console.log(`AI Gateway MVP running on http://0.0.0.0:${port}`);
     });

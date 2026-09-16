@@ -40,6 +40,7 @@
             <div style="padding: 20px; text-align: center; font-size: 18px; font-weight: bold;">AI Gateway</div>
             <el-menu :default-active="activeTab" class="el-menu-vertical" @select="handleSelect">
                 <el-menu-item index="models"><span>模型与映射</span></el-menu-item>
+                <el-menu-item index="optimizer"><span>提示词优化</span></el-menu-item>
                 <el-menu-item index="channels"><span>上游渠道管理</span></el-menu-item>
                 <el-menu-item index="keys"><span>网关密钥分发</span></el-menu-item>
                 <el-menu-item index="logout" @click="logout"><span>退出登录</span></el-menu-item>
@@ -80,6 +81,63 @@
                 </el-table>
             </div>
 
+            <div v-if="activeTab === 'optimizer'">
+                <el-card>
+                    <template #header>
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span>提示词优化服务默认值</span>
+                            <div>
+                                <el-button size="small" @click="testOptimizer()" :loading="optimizerTesting">测试连接</el-button>
+                                <el-button size="small" type="primary" @click="saveOptimizerDefaults" :loading="optimizerSaving">保存</el-button>
+                            </div>
+                        </div>
+                    </template>
+                    <el-alert type="info" :closable="false" style="margin-bottom: 16px;"
+                              title="开启后，网关会把用户的提示词和图片一起发给优化接口，再把优化后的提示词替换后发给上游。"
+                              description="这里保存的是默认值：在「模型与映射」里编辑模型、打开「提示词优化」开关即可生效，地址和密钥留空会自动沿用这里。优化接口必须是 OpenAI 兼容的 /v1/chat/completions，并且只接受 data URL 形式的图片。优化超时或报错时不会阻断生成：网关会自动改用用户原始提示词。" />
+                    <el-form :model="optimizerDefaults" label-position="top" style="max-width: 760px;">
+                        <el-form-item label="启用默认值">
+                            <el-switch v-model="optimizerDefaults.enabled" :active-value="1" :inactive-value="0" active-text="启用" inactive-text="停用"></el-switch>
+                            <span style="margin-left: 10px; color: #909399;">停用只影响之后新开的模型，已开启的模型仍会使用其自身配置。</span>
+                        </el-form-item>
+                        <el-form-item label="优化服务地址 (Base URL)">
+                            <el-input v-model="optimizerDefaults.optimizer_base_url" placeholder="https://api.mmg.lat"></el-input>
+                        </el-form-item>
+                        <el-form-item label="优化服务密钥">
+                            <el-input v-model="optimizerDefaults.optimizer_api_key" show-password placeholder="sk-..."></el-input>
+                            <div style="color: #909399; font-size: 12px;">留空表示保持已保存的密钥不变。</div>
+                        </el-form-item>
+                        <div style="display: grid; grid-template-columns: 1fr 220px; gap: 0 16px;">
+                            <el-form-item label="优化模型名">
+                                <el-input v-model="optimizerDefaults.optimizer_model" placeholder="h3-prompt-writing"></el-input>
+                            </el-form-item>
+                            <el-form-item label="超时时间 (毫秒)">
+                                <el-input-number v-model="optimizerDefaults.optimizer_timeout_ms" :min="1000" :max="600000" :step="10000" style="width: 100%;"></el-input-number>
+                            </el-form-item>
+                        </div>
+                        <el-form-item label="同时优化并发数">
+                            <el-input-number v-model="optimizerDefaults.optimizer_concurrency" :min="1" :max="32" style="width: 200px;"></el-input-number>
+                            <span style="margin-left: 10px; color: #909399;">优化服务对单账号有并发上限，超出会返回 Concurrency limit exceeded。网关按此数量排队，默认 2；批量提交时调大会更容易被限流，调小则排队更久。</span>
+                        </el-form-item>
+                        <el-form-item label="返回 JSON 结构化结果">
+                            <el-switch v-model="optimizerDefaults.optimizer_json_mode" :active-value="1" :inactive-value="0"></el-switch>
+                            <span style="margin-left: 10px; color: #909399;">建议开启：接口返回 JSON 时网关能准确取出提示词正文；关闭后按纯文本解析。</span>
+                        </el-form-item>
+                        <el-form-item label="允许 http 明文地址">
+                            <el-switch v-model="optimizerDefaults.optimizer_allow_http" :active-value="1" :inactive-value="0"></el-switch>
+                            <span style="margin-left: 10px; color: #909399;">仅自建内网优化服务时开启；http 地址下密钥会明文传输，公网服务请保持关闭并使用 https。</span>
+                        </el-form-item>
+                    </el-form>
+                    <div v-if="optimizerTestResult" style="max-width: 760px;">
+                        <el-alert :type="optimizerTestResult.success ? 'success' : 'error'" :closable="false"
+                                  :title="optimizerTestResult.success ? `优化成功（${optimizerTestResult.duration_ms} ms）` : `优化失败：${optimizerTestResult.error}`"
+                                  :description="optimizerTestResult.success ? `原提示词：${optimizerTestResult.original_prompt}` : '请检查地址、密钥与模型名是否正确。'" />
+                        <el-input v-if="optimizerTestResult.success" type="textarea" :rows="8" readonly
+                                  :model-value="optimizerTestResult.optimized_prompt" style="margin-top: 8px;"></el-input>
+                    </div>
+                </el-card>
+            </div>
+
             <div v-if="activeTab === 'channels'">
                 <div style="margin-bottom: 20px;"><el-button type="primary" @click="openChannelDialog()">新增上游渠道</el-button></div>
                 <el-table :data="channels" border style="width: 100%">
@@ -112,6 +170,68 @@
                         <el-form-item label="模型状态"><el-switch v-model="dialogForm.status" :active-value="1" :inactive-value="0" active-text="启用" inactive-text="禁用"></el-switch></el-form-item>
                     </div>
                     <el-form-item label="备注"><el-input v-model="dialogForm.remark" placeholder="模型用途、说明等（可选）"></el-input></el-form-item>
+
+                    <el-divider content-position="left">提示词优化</el-divider>
+                    <div class="binding-card" style="background: #fafafa;">
+                        <el-form-item label="对该模型开启提示词优化">
+                            <el-switch v-model="dialogForm.optimize_prompt" :active-value="1" :inactive-value="0" active-text="开启" inactive-text="关闭"></el-switch>
+                            <span style="margin-left: 10px; color: #909399;">开启后，网关把用户提示词与输入图片发给优化接口，用优化后的提示词请求上游；优化失败时自动改用原始提示词。</span>
+                        </el-form-item>
+                        <div v-if="dialogForm.optimize_prompt">
+                            <el-form-item label="优化模型名">
+                                <el-input v-model="dialogForm.optimizer_model" placeholder="留空则使用 h3-prompt-writing"></el-input>
+                            </el-form-item>
+                            <div style="display: grid; grid-template-columns: 220px 1fr; gap: 0 16px;">
+                                <el-form-item label="超时时间 (毫秒)">
+                                    <el-input-number v-model="dialogForm.optimizer_timeout_ms" :min="1000" :max="600000" :step="10000" style="width: 100%;"></el-input-number>
+                                </el-form-item>
+                                <el-form-item label="结构化输出与排查">
+                                    <el-switch v-model="dialogForm.optimizer_json_mode" :active-value="1" :inactive-value="0" active-text="要求 JSON" inactive-text="纯文本"></el-switch>
+                                    <el-switch v-model="dialogForm.optimizer_debug" :active-value="1" :inactive-value="0" active-text="返回优化信息" inactive-text="" style="margin-left: 16px;"></el-switch>
+                                </el-form-item>
+                            </div>
+                            <el-form-item v-if="optimizerDefaults.enabled && optimizerDefaults.optimizer_base_url">
+                                <el-alert type="success" :closable="false"
+                                          :title="`该模型沿用全局优化服务：${optimizerDefaults.optimizer_base_url}`"
+                                          description="如需为此模型单独指定地址或密钥，请展开下面的「单独指定优化服务」。" />
+                            </el-form-item>
+                            <el-form-item v-else>
+                                <el-alert type="warning" :closable="false" title="尚未配置全局优化服务"
+                                          description="请在下方填写该模型专用的接口地址与密钥，或先保存全局默认值，否则请求会跳过优化。" />
+                            </el-form-item>
+                            <el-collapse>
+                                <el-collapse-item title="单独指定优化服务（地址 / 密钥 / 自定义系统提示词）" name="override">
+                                    <el-form-item label="优化服务地址 (Base URL)">
+                                        <el-input v-model="dialogForm.optimizer_base_url" placeholder="留空沿用全局默认值"></el-input>
+                                    </el-form-item>
+                                    <el-form-item label="优化服务密钥">
+                                        <el-input v-model="dialogForm.optimizer_api_key" show-password placeholder="留空沿用全局默认值或已保存密钥"></el-input>
+                                    </el-form-item>
+                                    <el-form-item label="优化发送的媒体类型">
+                                        <el-select v-model="dialogForm.optimizer_send_media" style="width: 100%;">
+                                            <el-option label="仅图片（推荐）" value="image"></el-option>
+                                            <el-option label="图片 + 视频" value="image,video"></el-option>
+                                            <el-option label="图片 + 视频 + 音频" value="image,video,audio"></el-option>
+                                        </el-select>
+                                    </el-form-item>
+                                    <el-form-item label="自定义系统提示词">
+                                        <el-input type="textarea" :rows="4" v-model="dialogForm.optimizer_system_prompt" placeholder="留空使用内置的视频提示词改写指令"></el-input>
+                                    </el-form-item>
+                                    <el-form-item label="允许 http 明文地址">
+                                        <el-switch v-model="dialogForm.optimizer_allow_http" :active-value="1" :inactive-value="0"></el-switch>
+                                        <span style="margin-left: 10px; color: #909399;">仅自建内网优化服务时开启。</span>
+                                    </el-form-item>
+                                    <el-button size="small" @click="testOptimizer(dialogForm)" :loading="optimizerTesting">用该模型配置测试优化</el-button>
+                                    <div v-if="optimizerTestResult" style="margin-top: 12px;">
+                                        <el-alert :type="optimizerTestResult.success ? 'success' : 'error'" :closable="false"
+                                                  :title="optimizerTestResult.success ? `优化成功（${optimizerTestResult.duration_ms} ms）` : `优化失败：${optimizerTestResult.error}`" />
+                                        <el-input v-if="optimizerTestResult.success" type="textarea" :rows="6" readonly
+                                                  :model-value="optimizerTestResult.optimized_prompt" style="margin-top: 8px;"></el-input>
+                                    </div>
+                                </el-collapse-item>
+                            </el-collapse>
+                        </div>
+                    </div>
                     <el-divider content-position="left">渠道绑定</el-divider>
                     <div v-for="(binding, index) in dialogForm.bindings" :key="binding.local_id" class="binding-card">
                         <div class="binding-title">
@@ -193,6 +313,10 @@ const app = createApp({
         const channelForm = ref({});
         const keyDialogVisible = ref(false);
         const keyForm = ref({});
+        const optimizerDefaults = ref({ enabled: 0, optimizer_base_url: "", optimizer_api_key: "", optimizer_model: "h3-prompt-writing", optimizer_json_mode: 1, optimizer_timeout_ms: 120000, optimizer_allow_http: 0, optimizer_concurrency: 2 });
+        const optimizerTesting = ref(false);
+        const optimizerSaving = ref(false);
+        const optimizerTestResult = ref(null);
 
         if (token.value) { isLoggedIn.value = true; fetchData(); }
 
@@ -233,6 +357,7 @@ const app = createApp({
             const m = await requestApi("/models"); if (m) models.value = m;
             const c = await requestApi("/channels"); if (c) channels.value = c;
             const k = await requestApi("/keys"); if (k) keys.value = k;
+            const o = await requestApi("/optimizer/settings"); if (o) optimizerDefaults.value = normalizeOptimizerDefaults(o);
         }
 
         function defaultBinding() {
@@ -258,12 +383,86 @@ const app = createApp({
             return { ...defaultBinding(), ...binding, local_id: Math.random().toString(36).slice(2) };
         }
 
+        function normalizeOptimizerDefaults(settings) {
+            const merged = { ...optimizerDefaults.value, ...(settings || {}) };
+            return {
+                ...merged,
+                enabled: Number(merged.enabled) === 1 ? 1 : 0,
+                optimizer_json_mode: Number(merged.optimizer_json_mode) === 0 ? 0 : 1,
+                optimizer_allow_http: Number(merged.optimizer_allow_http) === 1 ? 1 : 0,
+                optimizer_concurrency: Number(merged.optimizer_concurrency) > 0 ? Number(merged.optimizer_concurrency) : 2,
+                optimizer_timeout_ms: Number(merged.optimizer_timeout_ms) > 0 ? Number(merged.optimizer_timeout_ms) : 120000,
+                optimizer_model: merged.optimizer_model || "h3-prompt-writing",
+                optimizer_api_key: "",
+                optimizer_base_url: merged.optimizer_base_url || ""
+            };
+        }
+
+        function fillModelOptimizerDefaults(form) {
+            form.optimize_prompt = Number(form.optimize_prompt) === 1 ? 1 : 0;
+            form.optimizer_model = form.optimizer_model || "";
+            form.optimizer_base_url = form.optimizer_base_url || "";
+            form.optimizer_api_key = "";
+            form.optimizer_system_prompt = form.optimizer_system_prompt || "";
+            form.optimizer_json_mode = Number(form.optimizer_json_mode) === 0 ? 0 : 1;
+            form.optimizer_allow_http = Number(form.optimizer_allow_http) === 1 ? 1 : 0;
+            form.optimizer_debug = Number(form.optimizer_debug) === 1 ? 1 : 0;
+            const timeout = Number(form.optimizer_timeout_ms);
+            form.optimizer_timeout_ms = timeout > 0 ? timeout : 120000;
+            form.optimizer_send_media = form.optimizer_send_media || "image";
+            return form;
+        }
+
+        function openOptimizerGlobalDialog() {
+            optimizerTestResult.value = null;
+            activeTab.value = "optimizer";
+            requestApi("/optimizer/settings").then(settings => {
+                if (settings) optimizerDefaults.value = normalizeOptimizerDefaults(settings);
+            });
+        }
+
+        async function saveOptimizerDefaults() {
+            optimizerSaving.value = true;
+            try {
+                const res = await requestApi("/optimizer/settings", "PUT", optimizerDefaults.value);
+                if (res && res.success) {
+                    ElementPlus.ElMessage.success("全局优化默认值已保存");
+                    if (res.settings) optimizerDefaults.value = normalizeOptimizerDefaults(res.settings);
+                }
+            } finally { optimizerSaving.value = false; }
+        }
+
+        // Runs one short text-only optimization so the operator can verify the
+        // address, key and model name without spending an upstream generation.
+        async function testOptimizer(config = null) {
+            const source = config || optimizerDefaults.value;
+            optimizerTesting.value = true;
+            optimizerTestResult.value = null;
+            try {
+                const res = await requestApi("/optimizer/test", "POST", {
+                    optimizer_base_url: source.optimizer_base_url,
+                    optimizer_api_key: source.optimizer_api_key,
+                    optimizer_model: source.optimizer_model,
+                    optimizer_json_mode: source.optimizer_json_mode,
+                    optimizer_timeout_ms: source.optimizer_timeout_ms,
+                    optimizer_allow_http: source.optimizer_allow_http,
+                    optimizer_concurrency: source.optimizer_concurrency
+                });
+                if (res) {
+                    optimizerTestResult.value = res;
+                    if (res.success) ElementPlus.ElMessage.success(`优化测试成功（${res.duration_ms} ms）`);
+                    else ElementPlus.ElMessage.error(`优化测试失败：${res.error}`);
+                }
+            } finally { optimizerTesting.value = false; }
+        }
+
         function openModelDialog(row = null) {
+            optimizerTestResult.value = null;
             if (row) {
-                dialogForm.value = JSON.parse(JSON.stringify(row));
+                dialogForm.value = fillModelOptimizerDefaults(JSON.parse(JSON.stringify(row)));
                 dialogForm.value.bindings = (dialogForm.value.bindings || []).map(normalizeBinding);
             } else {
-                dialogForm.value = { model_name: "", status: 1, remark: "", bindings: [defaultBinding()] };
+                dialogForm.value = fillModelOptimizerDefaults({ model_name: "", status: 1, remark: "", bindings: [defaultBinding()] });
             }
             dialogVisible.value = true;
         }
@@ -298,6 +497,9 @@ const app = createApp({
             if (!dialogForm.value.bindings || dialogForm.value.bindings.length === 0) return ElementPlus.ElMessage.warning("请至少配置一个渠道绑定");
             for (const binding of dialogForm.value.bindings) {
                 if (!binding.channel_id || !binding.route_path) return ElementPlus.ElMessage.warning("每个绑定都需要渠道和路由");
+            }
+            if (dialogForm.value.optimize_prompt && !dialogForm.value.optimizer_base_url && !optimizerDefaults.value.optimizer_base_url) {
+                return ElementPlus.ElMessage.warning("开启提示词优化前，请填写优化服务地址，或先保存全局优化默认值");
             }
             const method = dialogForm.value.id ? "PUT" : "POST";
             const path = dialogForm.value.id ? `/models/${dialogForm.value.id}` : "/models";
@@ -361,7 +563,9 @@ const app = createApp({
             models, channels, keys, dialogVisible, dialogForm, openModelDialog, saveModel, cloneModel, deleteModel,
             addBinding, cloneBinding, removeBinding, channelName,
             channelDialogVisible, channelForm, openChannelDialog, saveChannel, deleteChannel,
-            keyDialogVisible, keyForm, openKeyDialog, saveKey, deleteKey, generateKeyString, onUnlimitedChange
+            keyDialogVisible, keyForm, openKeyDialog, saveKey, deleteKey, generateKeyString, onUnlimitedChange,
+            optimizerDefaults, optimizerTesting, optimizerSaving, optimizerTestResult,
+            openOptimizerGlobalDialog, saveOptimizerDefaults, testOptimizer
         };
     }
 });

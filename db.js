@@ -69,6 +69,23 @@ async function migrate() {
 
     await addColumnIfMissing("logical_models", "remark", "TEXT NULL");
 
+    // Optional per-model prompt optimization: the gateway rewrites the caller's
+    // prompt through an external OpenAI-compatible service before forwarding.
+    await addColumnIfMissing("logical_models", "optimize_prompt", "TINYINT NOT NULL DEFAULT 0");
+    await addColumnIfMissing("logical_models", "optimizer_base_url", "VARCHAR(1024) NULL");
+    await addColumnIfMissing("logical_models", "optimizer_api_key", "TEXT NULL");
+    await addColumnIfMissing("logical_models", "optimizer_model", "VARCHAR(255) NOT NULL DEFAULT 'h3-prompt-writing'");
+    await addColumnIfMissing("logical_models", "optimizer_system_prompt", "TEXT NULL");
+    await addColumnIfMissing("logical_models", "optimizer_json_mode", "TINYINT NOT NULL DEFAULT 1");
+    await addColumnIfMissing("logical_models", "optimizer_timeout_ms", "INT NOT NULL DEFAULT 120000");
+    await addColumnIfMissing("logical_models", "optimizer_send_media", "VARCHAR(255) NOT NULL DEFAULT 'image'");
+    await addColumnIfMissing("logical_models", "optimizer_allow_http", "TINYINT NOT NULL DEFAULT 0");
+    await addColumnIfMissing("logical_models", "optimizer_debug", "TINYINT NOT NULL DEFAULT 0");
+
+    await addColumnIfMissing("async_tasks", "original_prompt", "LONGTEXT NULL");
+    await addColumnIfMissing("async_tasks", "optimized_prompt", "LONGTEXT NULL");
+    await addColumnIfMissing("async_tasks", "prompt_optimizer_meta", "TEXT NULL");
+
     await run(`CREATE TABLE IF NOT EXISTS model_bindings (
         id INT AUTO_INCREMENT PRIMARY KEY,
         logical_model_id INT NOT NULL,

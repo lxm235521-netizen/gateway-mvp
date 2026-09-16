@@ -1,11 +1,25 @@
 const express = require("express");
 const crypto = require("crypto");
 const { normalizeAuthType } = require("./upstream-auth");
+const { formatOptimizerError, optimizeWithConfig, resolveOptimizerConfig, GLOBAL_OPTIMIZER_FIELDS } = require("./prompt-optimizer-service");
+const {
+    readOptimizerDefaults: readSettingDefaults,
+    writeOptimizerDefaults: persistOptimizerDefaults
+} = require("./gateway-settings");
 const router = express.Router();
 
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
 const ADMIN_PASS = process.env.ADMIN_PASS || "admin-password";
 const ADMIN_TOKEN = crypto.createHash("sha256").update(ADMIN_PASS).digest("hex");
+
+// Sample body used by the admin "test optimization" action. Text only, so the
+// check costs one short optimizer call and never touches an upstream channel.
+const OPTIMIZER_TEST_PAYLOAD = {
+    model: "prompt-optimizer-test",
+    prompt: "深夜的旧仓库。老陈推开锈迹斑斑的铁门，手电光柱扫过满地纸箱。他身后跟着十七岁的小满。",
+    seconds: "10",
+    aspect_ratio: "16:9"
+};
 
 router.post("/login", (req, res) => {
     const { username, password } = req.body;
@@ -42,6 +56,38 @@ function normalizeBinding(binding) {
     };
 }
 
+const DEFAULT_OPTIMIZER_MODEL = "h3-prompt-writing";
+const DEFAULT_OPTIMIZER_TIMEOUT_MS = 120000;
+// The optimizer service caps concurrency per account; the gateway queues instead
+// of firing every request at once. This is a global-only knob.
+const DEFAULT_OPTIMIZER_CONCURRENCY = 2;
+
+// Accepts "image,video", "image video" and casing variants.
+function normalizeOptimizerMediaKinds(value) {
+    const kinds = String(value || "").split(/[,\s|;]+/)
+        .map(token => token.trim().toLowerCase())
+        .filter(token => ["image", "video", "audio"].includes(token));
+    return kinds.length > 0 ? [...new Set(kinds)].join(",") : "image";
+}
+
+function normalizeOptimizerConfig(body) {
+    const timeout = Number(body.optimizer_timeout_ms);
+    return {
+        optimize_prompt: body.optimize_prompt ? 1 : 0,
+        optimizer_base_url: body.optimizer_base_url ? String(body.optimizer_base_url).trim() : null,
+        optimizer_api_key: body.optimizer_api_key ? String(body.optimizer_api_key).trim() : null,
+        optimizer_model: body.optimizer_model ? String(body.optimizer_model).trim() : DEFAULT_OPTIMIZER_MODEL,
+        optimizer_system_prompt: body.optimizer_system_prompt ? String(body.optimizer_system_prompt) : null,
+        optimizer_json_mode: body.optimizer_json_mode === undefined ? 1 : (body.optimizer_json_mode ? 1 : 0),
+        optimizer_timeout_ms: Number.isFinite(timeout) && timeout > 0
+            ? Math.min(Math.max(Math.trunc(timeout), 1000), 600000)
+            : DEFAULT_OPTIMIZER_TIMEOUT_MS,
+        optimizer_send_media: normalizeOptimizerMediaKinds(body.optimizer_send_media),
+        optimizer_allow_http: body.optimizer_allow_http ? 1 : 0,
+        optimizer_debug: body.optimizer_debug ? 1 : 0
+    };
+}
+
 async function getModel(db, id) {
     const model = await db.get("SELECT * FROM logical_models WHERE id = ?", [id]);
     if (!model) return null;
@@ -49,6 +95,53 @@ async function getModel(db, id) {
         FROM model_bindings b JOIN channels c ON c.id = b.channel_id
         WHERE b.logical_model_id = ? ORDER BY b.id`, [id]);
     return model;
+}
+
+function readOptimizerDefaults(db) {
+    return readSettingDefaults(db);
+}
+
+async function writeOptimizerDefaults(db, body) {
+    const normalized = normalizeOptimizerConfig(body);
+    // An empty key means "keep the saved one" so the UI never round-trips secrets.
+    if (!normalized.optimizer_api_key) {
+        const existing = await readSettingDefaults(db);
+        normalized.optimizer_api_key = (existing && existing.optimizer_api_key) || null;
+    }
+    normalized.enabled = body.enabled ? 1 : 0;
+    const concurrency = Number(body.optimizer_concurrency);
+    normalized.optimizer_concurrency = Number.isFinite(concurrency) && concurrency > 0
+        ? Math.min(Math.max(Math.trunc(concurrency), 1), 32)
+        : DEFAULT_OPTIMIZER_CONCURRENCY;
+    await persistOptimizerDefaults(db, normalized);
+    return normalized;
+}
+
+// Saved connection values are used for the admin connectivity check, with any
+// value typed into the dialog taking precedence.
+function buildOptimizerTestConfig(defaults, body) {
+    const global = defaults || {};
+    // Same precedence as a real request: explicitly supplied value, then the saved
+    // global default, then the built-in default.
+    const config = resolveOptimizerConfig({ optimize_prompt: 1 }, global);
+    for (const field of GLOBAL_OPTIMIZER_FIELDS) {
+        const value = body ? body[field] : undefined;
+        if (value !== undefined && value !== null && String(value).trim() !== "") {
+            config[field] = value;
+        }
+    }
+    const concurrency = Number(body && body.optimizer_concurrency);
+    config.optimizer_concurrency = Number.isFinite(concurrency) && concurrency > 0
+        ? Math.trunc(concurrency)
+        : (global.optimizer_concurrency || DEFAULT_OPTIMIZER_CONCURRENCY);
+    config.optimize_prompt = 1;
+    config.optimizer_model = config.optimizer_model || DEFAULT_OPTIMIZER_MODEL;
+    config.optimizer_timeout_ms = config.optimizer_timeout_ms || DEFAULT_OPTIMIZER_TIMEOUT_MS;
+    config.optimizer_send_media = "image";
+    if (!config.optimizer_concurrency) {
+        config.optimizer_concurrency = DEFAULT_OPTIMIZER_CONCURRENCY;
+    }
+    return config;
 }
 
 module.exports = function(db) {
@@ -108,8 +201,17 @@ module.exports = function(db) {
 
     router.post("/models", adminAuth, async (req, res) => {
         const { model_name, status, remark, bindings } = req.body;
+        const optimizer = normalizeOptimizerConfig(req.body);
         try {
-            const result = await db.run("INSERT INTO logical_models (model_name, status, remark) VALUES (?, ?, ?)", [model_name, status !== undefined ? status : 1, remark || null]);
+            const result = await db.run(`INSERT INTO logical_models
+                (model_name, status, remark, optimize_prompt, optimizer_base_url, optimizer_api_key, optimizer_model,
+                 optimizer_system_prompt, optimizer_json_mode, optimizer_timeout_ms, optimizer_send_media, optimizer_allow_http, optimizer_debug)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                model_name,
+                status !== undefined ? status : 1,
+                remark || null,
+                ...Object.values(optimizer)
+            ]);
             const modelId = result.insertId;
             for (const binding of bindings || []) {
                 const item = normalizeBinding(binding);
@@ -123,8 +225,19 @@ module.exports = function(db) {
 
     router.put("/models/:id", adminAuth, async (req, res) => {
         const { model_name, status, remark, bindings } = req.body;
+        const optimizer = normalizeOptimizerConfig(req.body);
         try {
-            await db.run("UPDATE logical_models SET model_name=?, status=?, remark=? WHERE id=?", [model_name, status !== undefined ? status : 1, remark || null, req.params.id]);
+            await db.run(`UPDATE logical_models SET model_name=?, status=?, remark=?,
+                optimize_prompt=?, optimizer_base_url=?, optimizer_api_key=?, optimizer_model=?,
+                optimizer_system_prompt=?, optimizer_json_mode=?, optimizer_timeout_ms=?, optimizer_send_media=?,
+                optimizer_allow_http=?, optimizer_debug=?
+                WHERE id=?`, [
+                model_name,
+                status !== undefined ? status : 1,
+                remark || null,
+                ...Object.values(optimizer),
+                req.params.id
+            ]);
             if (Array.isArray(bindings)) {
                 for (const binding of bindings) {
                     const item = normalizeBinding(binding);
@@ -187,6 +300,60 @@ module.exports = function(db) {
             await db.run("UPDATE model_bindings SET status=0 WHERE id=?", [req.params.id]);
             res.json({ success: true });
         } catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    // Global defaults for the optional prompt optimizer. Per-model columns still
+    // win at request time, so turning a model on never breaks when these change.
+    router.get("/optimizer/settings", adminAuth, async (req, res) => {
+        try { res.json(await readOptimizerDefaults(db)); }
+        catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    router.put("/optimizer/settings", adminAuth, async (req, res) => {
+        try {
+            const saved = await writeOptimizerDefaults(db, req.body || {});
+            res.json({ success: true, settings: saved });
+        } catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    // Connectivity check: runs one short text-only optimization request so the
+    // operator can confirm URL, key and model name without creating a task.
+    router.post("/optimizer/test", adminAuth, async (req, res) => {
+        try {
+            const defaults = await readOptimizerDefaults(db);
+            const config = buildOptimizerTestConfig(defaults, req.body || {});
+            if (!config.optimizer_base_url) {
+                return res.status(400).json({ success: false, error: "请先填写提示词优化接口地址" });
+            }
+            if (!config.optimizer_api_key) {
+                return res.status(400).json({ success: false, error: "请先填写提示词优化接口密钥" });
+            }
+            const started = Date.now();
+            const { trace } = await optimizeWithConfig(OPTIMIZER_TEST_PAYLOAD, config);
+            const durationMs = Date.now() - started;
+            if (!trace || !trace.optimized) {
+                return res.json({
+                    success: false,
+                    duration_ms: durationMs,
+                    error: (trace && trace.reason) || "优化接口未返回可用的提示词"
+                });
+            }
+            return res.json({
+                success: true,
+                duration_ms: durationMs,
+                model: trace.model,
+                optimized_prompt: trace.optimized_prompt,
+                original_prompt: trace.original_prompt,
+                meta: {
+                    mode: trace.mode,
+                    duration_sec: trace.duration_sec,
+                    ratio: trace.ratio,
+                    shot_count: trace.shot_count
+                }
+            });
+        } catch (e) {
+            res.json({ success: false, error: formatOptimizerError(e) });
+        }
     });
 
     router.get("/keys", adminAuth, async (req, res) => {

@@ -391,7 +391,74 @@ $merge([
 
 Quality V4 不支持下游模板中的 `videos` 和 `audios`，因此该绑定不映射这两个字段。
 
-## 9. 容易出错的点
+## 9. 提示词优化（可选，按逻辑模型开启）
+
+部分下游用户写的提示词质量不高，可以让网关在转发上游之前，先把用户提示词和输入图片交给一个
+OpenAI 兼容的「提示词优化」服务改写，再用改写结果替换原提示词。该能力属于网关的请求预处理，
+默认关闭，只有显式开启的逻辑模型才会触发，其余模型完全不受影响。
+
+### 9.1 数据流
+
+1. 下游请求先做请求体校验，并选出该逻辑模型的一个 `model_bindings`（多绑定时按权重随机）。
+2. 若该逻辑模型开启优化，网关从原始请求体中取出提示词正文与输入图片。
+   - 提示词字段优先级：最后一条 `role=user` 的 `messages[].content` > `prompt` > `text` > `query` > `message` > `input` > `description`。
+   - `messages[].content` 为数组时取第一个 `type=text` 的片段；优化结果写回同一位置，其余片段保持不变。
+   - 媒体字段：`images`、`image`、`image_url`、`image_urls`、`init_image`、`first_frame`、`last_frame`、`reference_images`、`videos`、`audios` 等；支持字符串、数组和 `{ "url": ... }` 对象。
+3. 校验图片（默认最多 9 张、单张 ≤ 8MB）。优化服务只接受 `data:` URL，因此 `http(s)` 图片会由网关下载并转成 Data URL（按真实字节嗅探 png/jpeg/gif/webp，不信任声明的 MIME）；不支持的格式会让本次优化跳过并降级。
+4. 调用优化接口 `POST {base_url}/v1/chat/completions`，`Authorization: Bearer <密钥>`，`model` 为优化模型名，`messages` 里带一段系统提示词和「提示词 + 图片」的用户消息。
+5. 取回结果后清洗成提示词正文：优先取 JSON 里的 `prompt`/`optimized_prompt`/`rewritten_prompt`/`text`；否则按纯文本处理，去掉 `<!-- ... -->` 元信息、markdown 代码围栏和开头的中文标题行。
+6. 把清洗后的正文写回原 `textPath`，替换后的请求体再按 `req_mapping` 映射并发给上游。
+7. 异步视频任务会把 `original_prompt`、`optimized_prompt`、`prompt_optimizer_meta` 快照写进 `async_tasks`，便于对账。
+
+**优化失败不阻断生成**：超时、网络错误、4xx/5xx、返回内容不可解析等情况一律降级为「使用用户原始提示词」继续请求上游，只在日志中记录原因；响应体里的 `prompt_optimizer.reason` 也会带上原因，便于排查。
+
+### 9.2 logical_models 配置字段
+
+- `optimize_prompt`：`1` 开启该模型的提示词优化，`0` 关闭。
+- `optimizer_base_url`：优化服务地址，可填 `https://api.mmg.lat`，也可直接填完整的 `/v1/chat/completions`。
+- `optimizer_api_key`：优化服务密钥。为空时回退到环境变量 `OPTIMIZER_API_KEY`。
+- `optimizer_model`：优化服务上的模型名，默认 `h3-prompt-writing`。
+- `optimizer_system_prompt`：覆盖内置的系统提示词，留空使用内置的视频提示词改写指令。
+- `optimizer_json_mode`：`1` 在用户消息末尾附加「请返回 json 格式。」以获得结构化结果，`0` 按纯文本处理。
+- `optimizer_timeout_ms`：超时时间，默认 `120000`。实测纯文本约 12–22 秒，带图约 15–35 秒，不建议低于 60000。
+- `optimizer_send_media`：发给优化服务的媒体类型，逗号分隔，可选 `image`、`video`、`audio`，默认 `image`。
+- `optimizer_allow_http`：`1` 允许 http 明文优化地址。出于密钥安全默认 `0`；优化地址是 http 且未开启时，网关会跳过优化并在日志中说明。
+- `optimizer_debug`：`1` 时在同步响应里返回 `prompt_optimizer` 字段（是否优化成功、耗时、模式、镜头数等）；失败降级时无论该开关如何都会返回。
+
+后台「提示词优化」页可保存优化服务的全局默认值（存在 `gateway_settings` 表的 `prompt_optimizer_defaults`），
+每个逻辑模型只需打开开关即可沿用；模型里留空的地址/密钥/模型名会回退到全局默认值。
+「测试连接」按钮用一条很短的文本请求做连通性检查，不会创建上游任务。
+
+### 9.3 并发、重试与超时
+
+优化服务对单个账号有并发上限，超出时会返回类似
+`HTTP 502 ... Concurrency limit exceeded for account, please retry later` 的错误。网关做三层处理：
+
+1. **排队限流**：网关自身限制同时发往优化服务的请求数，默认 2，可在后台「提示词优化」页调整。
+   超出的请求排队等待，不直接撞服务端上限；排队超过 180 秒仍未获得执行机会才会降级。
+2. **限流重试**：识别到并发/限流类错误（`concurrency limit`、`too many requests`、`rate limit`、`并发`、`限流` 等）时，
+   最多重试 3 次，间隔 2 秒、6 秒。其他 4xx/5xx 不重试，直接降级。
+3. **自动降级**：仍失败就用用户原始提示词继续请求上游，响应里的 `prompt_optimizer.reason` 会说明原因。
+
+失败响应的 `prompt_optimizer` 还会带 `attempts`（实际请求次数）和 `queue_wait_ms`（排队耗时），便于判断是排队还是服务端慢。
+
+注意事项：
+
+- 实测单次优化延迟波动较大：13–22 秒（本地）、46–52 秒（服务繁忙）、带图最慢见过约 120 秒。
+  `optimizer_timeout_ms` 默认 120000，不建议调小；这个超时只作用于单次 HTTP 调用，不含排队时间。
+- 排队会让后面的请求变慢：并发数调小排队更久，调大更容易被服务端限流。业务量大时建议按上游账号的实际并发额度设置。
+- 每个模型也可以单独关闭优化；优化失败不影响视频生成，只是这次没有优化。
+
+### 9.4 注意事项
+
+- 提示词优化是同步调用，会给每个开启该功能的请求增加一次优化耗时；它只影响延迟，不额外计入网关额度。
+- 优化后的提示词是给视频/图片模型用的，会原样替换下游放在 `prompt`（或 user 消息）里的内容；不要让同一次请求既依赖原始提示词做别的事情。
+- 优化服务通常会把结果包一层 markdown 标题或代码围栏，网关已自动清洗；若上游模型对格式敏感，建议保持 `optimizer_json_mode = 1`。
+- 图片必须是真实可解码的图片数据；1×1 之类的占位图可能被优化服务的上游模型拒绝，此时会自动降级并保留原提示词。
+- 修改优化配置只影响之后的请求，不会改变已经提交的异步任务。
+- 优化服务地址务必使用 https，除非是内网自建服务；http 地址需要显式打开 `optimizer_allow_http`，密钥会明文传输。
+
+## 10. 容易出错的点
 
 - 不要把下游模板字段改成上游字段。应该在 `req_mapping` 中翻译。
 - 不要忘记异步提交响应的 `task_id`，否则网关无法保存上游任务号。
@@ -402,7 +469,7 @@ Quality V4 不支持下游模板中的 `videos` 和 `audios`，因此该绑定�
 - 不要把上游文档里的示例 URL、示例 key、示例 prompt 当成生产配置。
 - 如果下游使用网关自有 key，必须在渠道或绑定中配置上游 key，否则上游请求可能没有有效鉴权。
 
-## 10. 非 Bearer 渠道与 Vylai MiniMax H3
+## 11. 非 Bearer 渠道与 Vylai MiniMax H3
 
 渠道的 `auth_type` 默认为 `bearer`，也可在后台选择 `x-auth-token`。
 后者把选中的上游密钥发送为 `X-Auth-Token: <key>`；密钥优先级不变。
