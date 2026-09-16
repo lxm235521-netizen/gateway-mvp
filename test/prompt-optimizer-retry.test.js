@@ -136,11 +136,11 @@ test("a request that waits past the configured queue limit falls back", async ()
 
 test("queue wait and concurrency defaults are the documented values", () => {
     const service = loadServiceWith({ async post() { throw new Error("unused"); }, async get() { throw new Error("unused"); } });
-    assert.equal(service.DEFAULT_OPTIMIZER_CONCURRENCY, 8);
+    assert.equal(service.DEFAULT_OPTIMIZER_CONCURRENCY, 500);
     assert.equal(service.DEFAULT_QUEUE_WAIT_MS, 300000);
-    assert.equal(service.resolveConcurrency({}), 8);
-    assert.equal(service.resolveConcurrency({ optimizer_concurrency: 32 }), 32);
-    assert.equal(service.resolveConcurrency({ optimizer_concurrency: 500 }), 500, "the configured maximum is accepted");
+    assert.equal(service.resolveConcurrency({}), 500, "the default does not queue at all");
+    assert.equal(service.resolveConcurrency({ optimizer_concurrency: 2 }), 2, "an explicit low value still throttles");
+    assert.equal(service.resolveConcurrency({ optimizer_concurrency: 500 }), 500);
     assert.equal(service.resolveConcurrency({ optimizer_concurrency: 5000 }), 500, "clamped to the maximum");
     assert.equal(service.resolveQueueWaitMs({}), 300000);
     assert.equal(service.resolveQueueWaitMs({ optimizer_queue_wait_ms: 60000 }), 60000);

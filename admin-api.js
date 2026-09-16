@@ -60,7 +60,7 @@ const DEFAULT_OPTIMIZER_MODEL = "h3-prompt-writing";
 const DEFAULT_OPTIMIZER_TIMEOUT_MS = 120000;
 // The optimizer throttles per account when a burst lands at once; the gateway
 // queues instead. These two are global-only knobs.
-const DEFAULT_OPTIMIZER_CONCURRENCY = 8;
+const DEFAULT_OPTIMIZER_CONCURRENCY = 500;
 const MAX_OPTIMIZER_CONCURRENCY = 500;
 const DEFAULT_OPTIMIZER_QUEUE_WAIT_MS = 300000;
 

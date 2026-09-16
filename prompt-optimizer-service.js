@@ -204,10 +204,11 @@ function isInsecureHttpAllowed(config) {
     return value === 1 || value === true || value === "1";
 }
 
-// How many optimizer calls may be in flight at once. The default leaves room for
-// a burst; the ceiling is high enough that an operator who has confirmed the
-// optimizer account tolerates it can effectively turn queueing off.
-const DEFAULT_OPTIMIZER_CONCURRENCY = 8;
+// How many optimizer calls may be in flight at once. The optimizer account is
+// provisioned well beyond this gateway's traffic, so the default does not queue
+// at all; lower it only if the optimizer starts answering with
+// "Concurrency limit exceeded".
+const DEFAULT_OPTIMIZER_CONCURRENCY = 500;
 const MAX_OPTIMIZER_CONCURRENCY = 500;
 const DEFAULT_QUEUE_WAIT_MS = 300000;
 const MAX_QUEUE_WAIT_MS = 3600000;

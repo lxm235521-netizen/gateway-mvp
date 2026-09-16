@@ -123,7 +123,7 @@
                         </div>
                         <el-alert type="info" :closable="false" style="margin-bottom: 16px;"
                                   title="并发数与排队上限怎么调"
-                                  description="优化服务对账号有并发上限，网关会按「同时优化并发数」排队，默认 8，上限 500。只有日志里反复出现 Concurrency limit exceeded 时才需要调低；调到 500 相当于基本不排队。排队超过「排队等待上限」会放弃优化、改用原始提示词，默认 300000（5 分钟）。" />
+                                  description="默认 500，即不做并发限制、不排队；账号并发额度充足，一般无需修改。仅当日志里反复出现 Concurrency limit exceeded 时才调低。排队超过「排队等待上限」会放弃优化、改用原始提示词，默认 300000（5 分钟）—— 只有把并发调低后这一项才会真正起作用。" />
                         <el-form-item label="返回 JSON 结构化结果">
                             <el-switch v-model="optimizerDefaults.optimizer_json_mode" :active-value="1" :inactive-value="0"></el-switch>
                             <span style="margin-left: 10px; color: #909399;">建议开启：接口返回 JSON 时网关能准确取出提示词正文；关闭后按纯文本解析。</span>
@@ -318,7 +318,7 @@ const app = createApp({
         const channelForm = ref({});
         const keyDialogVisible = ref(false);
         const keyForm = ref({});
-        const optimizerDefaults = ref({ enabled: 0, optimizer_base_url: "", optimizer_api_key: "", optimizer_model: "h3-prompt-writing", optimizer_json_mode: 1, optimizer_timeout_ms: 120000, optimizer_allow_http: 0, optimizer_concurrency: 8, optimizer_queue_wait_ms: 300000 });
+        const optimizerDefaults = ref({ enabled: 0, optimizer_base_url: "", optimizer_api_key: "", optimizer_model: "h3-prompt-writing", optimizer_json_mode: 1, optimizer_timeout_ms: 120000, optimizer_allow_http: 0, optimizer_concurrency: 500, optimizer_queue_wait_ms: 300000 });
         const optimizerTesting = ref(false);
         const optimizerSaving = ref(false);
         const optimizerTestResult = ref(null);
@@ -395,7 +395,7 @@ const app = createApp({
                 enabled: Number(merged.enabled) === 1 ? 1 : 0,
                 optimizer_json_mode: Number(merged.optimizer_json_mode) === 0 ? 0 : 1,
                 optimizer_allow_http: Number(merged.optimizer_allow_http) === 1 ? 1 : 0,
-                optimizer_concurrency: Number(merged.optimizer_concurrency) > 0 ? Number(merged.optimizer_concurrency) : 8,
+                optimizer_concurrency: Number(merged.optimizer_concurrency) > 0 ? Number(merged.optimizer_concurrency) : 500,
                 optimizer_queue_wait_ms: Number(merged.optimizer_queue_wait_ms) > 0 ? Number(merged.optimizer_queue_wait_ms) : 300000,
                 optimizer_timeout_ms: Number(merged.optimizer_timeout_ms) > 0 ? Number(merged.optimizer_timeout_ms) : 120000,
                 optimizer_model: merged.optimizer_model || "h3-prompt-writing",
