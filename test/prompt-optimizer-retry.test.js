@@ -140,7 +140,8 @@ test("queue wait and concurrency defaults are the documented values", () => {
     assert.equal(service.DEFAULT_QUEUE_WAIT_MS, 300000);
     assert.equal(service.resolveConcurrency({}), 8);
     assert.equal(service.resolveConcurrency({ optimizer_concurrency: 32 }), 32);
-    assert.equal(service.resolveConcurrency({ optimizer_concurrency: 999 }), 64, "clamped to the maximum");
+    assert.equal(service.resolveConcurrency({ optimizer_concurrency: 500 }), 500, "the configured maximum is accepted");
+    assert.equal(service.resolveConcurrency({ optimizer_concurrency: 5000 }), 500, "clamped to the maximum");
     assert.equal(service.resolveQueueWaitMs({}), 300000);
     assert.equal(service.resolveQueueWaitMs({ optimizer_queue_wait_ms: 60000 }), 60000);
     assert.equal(service.resolveQueueWaitMs({ optimizer_queue_wait_ms: 1 }), 10000, "clamped to the minimum");

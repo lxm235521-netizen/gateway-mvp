@@ -115,7 +115,7 @@
                                 <el-input-number v-model="optimizerDefaults.optimizer_timeout_ms" :min="1000" :max="600000" :step="10000" style="width: 100%;"></el-input-number>
                             </el-form-item>
                             <el-form-item label="同时优化并发数">
-                                <el-input-number v-model="optimizerDefaults.optimizer_concurrency" :min="1" :max="64" style="width: 100%;"></el-input-number>
+                                <el-input-number v-model="optimizerDefaults.optimizer_concurrency" :min="1" :max="500" style="width: 100%;"></el-input-number>
                             </el-form-item>
                             <el-form-item label="排队等待上限 (毫秒)">
                                 <el-input-number v-model="optimizerDefaults.optimizer_queue_wait_ms" :min="10000" :max="3600000" :step="60000" style="width: 100%;"></el-input-number>
@@ -123,7 +123,7 @@
                         </div>
                         <el-alert type="info" :closable="false" style="margin-bottom: 16px;"
                                   title="并发数与排队上限怎么调"
-                                  description="优化服务对账号有并发上限，网关会按「同时优化并发数」排队，默认 8。只有并发突然变大时才需要调低。排队超过「排队等待上限」会放弃优化、改用原始提示词，默认 5 分钟；批量提交较多时可适当调大，避免白白排队后仍被放弃。" />
+                                  description="优化服务对账号有并发上限，网关会按「同时优化并发数」排队，默认 8，上限 500。只有日志里反复出现 Concurrency limit exceeded 时才需要调低；调到 500 相当于基本不排队。排队超过「排队等待上限」会放弃优化、改用原始提示词，默认 300000（5 分钟）。" />
                         <el-form-item label="返回 JSON 结构化结果">
                             <el-switch v-model="optimizerDefaults.optimizer_json_mode" :active-value="1" :inactive-value="0"></el-switch>
                             <span style="margin-left: 10px; color: #909399;">建议开启：接口返回 JSON 时网关能准确取出提示词正文；关闭后按纯文本解析。</span>

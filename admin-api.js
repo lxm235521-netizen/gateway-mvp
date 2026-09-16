@@ -61,6 +61,7 @@ const DEFAULT_OPTIMIZER_TIMEOUT_MS = 120000;
 // The optimizer throttles per account when a burst lands at once; the gateway
 // queues instead. These two are global-only knobs.
 const DEFAULT_OPTIMIZER_CONCURRENCY = 8;
+const MAX_OPTIMIZER_CONCURRENCY = 500;
 const DEFAULT_OPTIMIZER_QUEUE_WAIT_MS = 300000;
 
 function clampInt(value, fallback, min, max) {
@@ -118,7 +119,7 @@ async function writeOptimizerDefaults(db, body) {
         normalized.optimizer_api_key = (existing && existing.optimizer_api_key) || null;
     }
     normalized.enabled = body.enabled ? 1 : 0;
-    normalized.optimizer_concurrency = clampInt(body.optimizer_concurrency, DEFAULT_OPTIMIZER_CONCURRENCY, 1, 64);
+    normalized.optimizer_concurrency = clampInt(body.optimizer_concurrency, DEFAULT_OPTIMIZER_CONCURRENCY, 1, MAX_OPTIMIZER_CONCURRENCY);
     normalized.optimizer_queue_wait_ms = clampInt(body.optimizer_queue_wait_ms, DEFAULT_OPTIMIZER_QUEUE_WAIT_MS, 10000, 3600000);
     await persistOptimizerDefaults(db, normalized);
     return normalized;

@@ -204,13 +204,11 @@ function isInsecureHttpAllowed(config) {
     return value === 1 || value === true || value === "1";
 }
 
-// The optimizer throttles per account when too many requests land at once, so
-// requests are queued rather than all fired in parallel. The limit is generous by
-// default because the queue itself is the risk: every request stuck behind it
-// waits, and one that waits past optimizer_queue_wait_ms falls back. Raise
-// concurrency to match real throughput, lower it only if the optimizer starts
-// rejecting with "Concurrency limit exceeded".
+// How many optimizer calls may be in flight at once. The default leaves room for
+// a burst; the ceiling is high enough that an operator who has confirmed the
+// optimizer account tolerates it can effectively turn queueing off.
 const DEFAULT_OPTIMIZER_CONCURRENCY = 8;
+const MAX_OPTIMIZER_CONCURRENCY = 500;
 const DEFAULT_QUEUE_WAIT_MS = 300000;
 const MAX_QUEUE_WAIT_MS = 3600000;
 
@@ -224,7 +222,7 @@ function resolveConcurrency(config) {
     if (!Number.isFinite(raw) || raw <= 0) {
         return DEFAULT_OPTIMIZER_CONCURRENCY;
     }
-    return Math.min(Math.max(Math.trunc(raw), 1), 64);
+    return Math.min(Math.max(Math.trunc(raw), 1), MAX_OPTIMIZER_CONCURRENCY);
 }
 
 function resolveQueueWaitMs(config) {
