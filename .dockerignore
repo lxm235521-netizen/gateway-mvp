@@ -1,2 +1,5 @@
 node_modules/
 .env
+# NOTE: .docker-ffmpeg-debs/ must stay in the build context — the Dockerfile installs
+# those packages and deletes them in the same layer, so the final image stays lean.
+.content-cache/

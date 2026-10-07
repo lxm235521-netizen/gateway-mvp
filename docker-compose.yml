@@ -11,6 +11,14 @@ services:
       ADMIN_USER: ${ADMIN_USER}
       ADMIN_PASS: ${ADMIN_PASS}
       POLL_MIN_INTERVAL_SECONDS: ${POLL_MIN_INTERVAL_SECONDS:-6}
+      # On-demand H.264 renditions (/content?format=h264) are cached here so they
+      # survive container restarts and are only transcoded once per task.
+      CONTENT_CACHE_DIR: ${CONTENT_CACHE_DIR:-/app/content-cache}
+    volumes:
+      - content-cache:/app/content-cache
     ports:
       - "3009:3000"
     restart: unless-stopped
+
+volumes:
+  content-cache:

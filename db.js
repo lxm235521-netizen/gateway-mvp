@@ -57,6 +57,15 @@ async function addColumnIfMissing(tableName, columnName, definition) {
 async function migrate() {
     await addColumnIfMissing("channels", "auth_type", "VARCHAR(32) NOT NULL DEFAULT 'bearer'");
     await addColumnIfMissing("channels", "convert_base64_to_url", "TINYINT NOT NULL DEFAULT 0");
+    // Response-side counterpart of convert_base64_to_url: some upstreams answer with
+    // inline base64 (data URL / b64_json) instead of a link, and the downstream template
+    // only accepts an http URL. Only channels that opt in are traversed.
+    await addColumnIfMissing("channels", "convert_resp_base64_to_url", "TINYINT NOT NULL DEFAULT 0");
+    // Opt-in safety net for the video content proxy: when the upstream result URL
+    // (often a signed third-party CDN link) answers 401/403, retry once against the
+    // upstream's own {base_url}/v1/tasks/{id}/download endpoint. Only channels that
+    // opt in are affected; the global CONTENT_FALLBACK_ENABLED env flag can force it.
+    await addColumnIfMissing("channels", "content_fallback_enabled", "TINYINT NOT NULL DEFAULT 0");
     await addColumnIfMissing("async_tasks", "upstream_auth_type_snapshot", "VARCHAR(32) NULL");
     await run(`CREATE TABLE IF NOT EXISTS logical_models (
         id INT AUTO_INCREMENT PRIMARY KEY,

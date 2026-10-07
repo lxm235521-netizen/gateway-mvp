@@ -5,3 +5,10 @@ mysql_data/
 *.log
 npm-debug.log*
 .DS_Store
+# Pre-downloaded apt packages used to build the image without relying on a reachable
+# apt mirror (see tools/fetch-ffmpeg-debs.sh). 130MB of build inputs, not source.
+.docker-ffmpeg-debs/
+# Locally cached H.264 renditions when running the gateway outside Docker.
+.content-cache/
+# Local SSH askpass helper used for ad-hoc server work; never part of the project.
+tools/_askpass.cmd

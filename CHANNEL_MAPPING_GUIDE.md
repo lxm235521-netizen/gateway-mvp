@@ -181,7 +181,29 @@ Content-Type: application/json
 - `base_url`：上游基础地址，不含具体接口路径时最好不要以多余路径结尾。例如上游完整地址是 `https://example.com/v1/videos`，则 `base_url` 可填 `https://example.com/v1`，`route_path` 填 `/videos`。
 - `api_key`：上游固定密钥。若为空，网关会尝试使用下游传入的 Bearer key 透传给上游。
 - `status`：`1` 启用，`0` 禁用。
-- `convert_base64_to_url`：`1` 时，提交到该渠道前会将请求体中 `data:image/...;base64,...` 图片上传到 `https://wgspai.cn/image-bed/api/upload`，并替换为返回的 HTTPS URL；`0` 保持原样。
+- `convert_base64_to_url`：`1` 时，提交到该渠道前会将请求体中 `data:image/...;base64,...` 图片上传到图床（默认 Zipline `https://files.mmg.lat/api/upload`），并替换为返回的 HTTPS URL；`0` 保持原样。
+- `convert_resp_base64_to_url`：`1` 时，该渠道**返回**给下游之前会把响应体里的 `data:image/...`、裸 base64（仅限 `b64_json`/`url`/`image_urls`/`image`/`data`/`content` 等图片字段名，且长度 ≥128 的纯 base64 字符）以及 Markdown 图片里的 data URL 上传到同一个图床，替换成 HTTPS 链接；`0` 保持原样。
+  上游只按 base64 返回图片、而下游要求 http 链接时必须打开这个开关。上传失败不会让请求失败，
+  网关会记日志并原样返回上游结果（详见第 11.6 节）。
+
+### 图床（Zipline，请求/响应两侧共用）
+
+两个开关共用同一个上传函数 `uploadBase64Image`，行为如下：
+
+- 上传：`POST {IMAGE_BED_UPLOAD_URL}`，`multipart/form-data`，字段名 `file`，
+  文件名按真实嗅探出的扩展名（`image.png`/`image.jpg`/`image.gif`/`image.webp`），并带真实 content-type。
+- 鉴权：默认请求头 `Authorization: <IMAGE_BED_TOKEN>`，token 形如 `zk_...`（Zipline 的 key 直接放该头即可，
+  加不加 `Bearer ` 前缀服务端都接受）。另外默认带 `x-zipline-no-json: true`，让图床**直接回纯文本 URL**。
+- 回答解析兼容两种形态：纯文本 URL（默认），以及 JSON（`{"files":[{"url":"..."}]}`，或顶层 `url`）。
+  两种都能解析出链接；解析不出链接时按上传失败处理。
+- 默认值写在 `server.js` 顶部，可用环境变量覆盖：
+  `IMAGE_BED_UPLOAD_URL`（默认 `https://files.mmg.lat/api/upload`）、
+  `IMAGE_BED_TOKEN`（默认项目内置 key，轮换 key 时改这里）、
+  `IMAGE_BED_AUTH_HEADER`（默认 `Authorization`）、
+  `IMAGE_BED_NO_JSON=0` 可关闭“要求纯文本回答”。
+- 自检：`node tools/check-image-bed.js`（上传 1×1 PNG，分别验证纯文本与 JSON 两种回答的解析）。
+- 注意 Zipline 免费额度下上传的文件**会到期自动删除**（实测返回体里的 `deletesAt` 约 2 天后）。
+  对"生成后立刻把链接交给上游/下游"的用法没有影响，但如果指望图床长期保管图片，需要自建或付费实例。
 
 ### logical_models
 
@@ -214,10 +236,20 @@ Content-Type: application/json
 - 上游不支持的字段不要映射，例如上游不支持 `videos` 或 `audios` 时直接忽略。
 - 上游字段有默认值要求时，在 `req_mapping` 中补默认值。
 - 下游字符串数字传给上游数字字段时，用 `$number(...)`。
+- 反过来，上游字段是字符串类型（部分上游的 Go 结构体把 `seconds` 声明成 `string`）时必须发字符串：
+  用 `$string($round(...))` 输出整数字符串，否则上游会以 `invalid_json` /
+  `cannot unmarshal number into Go struct field ... of type string` 拒绝整个请求。
+  以本仓库的 snumom `wan3.0-image-prime` 绑定为例，`$number` 只用于区间校验，落到请求体里的仍是 `"10"` 这样的字符串。
+  上游是 Go 网关时字段声明与文档示例往往以字符串形式出现（例如文档示例写 `"seconds": "10"`），
+  新增渠道时优先按文档示例的字面类型映射。
 - 上游模型名固定时，在 `req_mapping` 中写死真实上游模型名。
 - 异步提交响应必须把上游任务 ID 映射成 `task_id`。
 - 轮询完成响应必须把上游成品 URL 映射成 `video_url`。
 - 状态枚举要归一到网关模板常用值：`queued`、`processing`、`completed`、`failed`。
+- 轮询映射必须保证 `status` 一定有值：上游响应缺 `status`、缺 `data` 包装或直接返回错误体时，
+  要输出 `failed`（并带上可读的 `error`），否则下游拿到没有状态的响应只会一直轮询。
+- 上游出错字段名和时机都不固定：只要响应里出现错误信息（例如 `error`、`error_message`、
+  `display_error_message`），就归一为 `failed`，不要管上游 `status` 是否已经翻到失败态。
 
 常用请求映射骨架：
 
@@ -475,13 +507,15 @@ OpenAI 兼容的「提示词优化」服务改写，再用改写结果替换原�
 - 不要把上游文档里的示例 URL、示例 key、示例 prompt 当成生产配置。
 - 如果下游使用网关自有 key，必须在渠道或绑定中配置上游 key，否则上游请求可能没有有效鉴权。
 
-## 11. 非 Bearer 渠道与 Vylai MiniMax H3
+## 11. 非 Bearer 渠道与已配置渠道示例
 
 渠道的 `auth_type` 默认为 `bearer`，也可在后台选择 `x-auth-token`。
 后者把选中的上游密钥发送为 `X-Auth-Token: <key>`；密钥优先级不变。
 提交、轮询和开启代理时的同源视频内容请求均使用该方式。新任务保存
 `upstream_auth_type_snapshot`，旧任务无快照时继续使用 Bearer。
 修改已有渠道鉴权方式不会改变已提交任务。
+
+### 11.1 Vylai MiniMax H3
 
 Vylai MiniMax H3 使用 `https://queueapi.vylai.com`，鉴权为 `x-auth-token`。
 三个模板及可复用的映射位于 `scripts/vylai-minimax-config.js`。
@@ -490,8 +524,610 @@ Vylai MiniMax H3 使用 `https://queueapi.vylai.com`，鉴权为 `x-auth-token`�
 Fast 模板必须提供图片且不支持音频，所有模板都不映射视频输入。
 未提供 resolution 时省略该配置，使用上游模板默认值。
 创建响应使用 `data.task_id`，完成结果使用 `data.result_oss_url`，按结果直链返回。
+同一渠道下的 SD 2.0 Fast 模板（`75api-sd20-fast-20260919`）见 11.7 节：它复用这里导出的
+`buildPollMapping`，创建请求的 `config_values` 形状不同。
+
+轮询映射（`buildPollMapping`）除了归一状态，还负责把上游异常落成终态，规则如下：
+
+- 只要响应里出现 `error_message`、`error` 或 `display_error_message`，无论上游 `status` 是否已经
+  翻到 `failed`（实测可能仍是 `pending` / `preparing` / `running`），都输出下面的失败形状。
+- 失败形状固定为下游要求的格式（`id` / `task_id` 由 `server.js` 轮询后覆盖成网关任务号）：
+
+```json
+{
+  "id": "gw_task_id",
+  "task_id": "gw_task_id",
+  "object": "video.generation",
+  "model": "75api-minimax-h3-audio-20260911",
+  "status": "failed",
+  "progress": 100,
+  "created_at": 1789820187,
+  "completed_at": 1789820192,
+  "error": {
+    "message": "参考图下载失败: Client error '420 ' for url 'https://img.alicdn.com/...jpg'",
+    "code": "reference_image_download_failed"
+  }
+}
+```
+
+- 失败时不输出 `video_url`；`progress` 固定 `100`；`completed_at` 取上游 `updated_at`（缺失或不可解析时
+  取当前时间）。
+- `error.message` 格式化：去掉 `[pod 名]` 前缀，把换行和连续空白压成单个空格，去掉尾部
+  `For more information check: ...` 链接，并把上游用词「下载图像失败」统一成「参考图下载失败」；
+  只有 `display_error_*` 时直接用它的描述正文（不再拼错误码前缀）；`error` 是对象时取其中的
+  `message` / `msg` / `code`；完全没有错误文本时输出 `上游任务失败: <status>` / `上游未返回任务状态`。
+- `error.code` 按语义归类：`reference_image_download_failed`（参考图/图片下载失败）、
+  `gpu_out_of_memory`（显存不足）、`content_moderation`（上游 `display_error_code` 为
+  `CONTENT_MODERATION`）、`video_generation_cancelled`（上游取消），其余回落
+  `video_generation_failed`。
+- 响应没有 `data` 包装、完全没有 `status`，或返回 `{ code: 500, msg: ... }` 这类错误体时，同样输出
+  这个失败形状。旧映射在这种情况下会输出一个不带 `status` 的对象，下游只能一直轮询，
+  表现就是任务永远停在“进行中/未启动”。
+- 完成时保持原来的形状（`status: "completed"`、`progress: 100`、`object` 与 `video_url` 都是结果直链、
+  `error: null`，并带 `completed_at`）；进行中输出 `queued` / `processing` 且 `error: null`。
+- 只有上游明确给出成功状态（`completed` 等）时才输出 `completed`；无法识别的状态归一为 `processing`，
+  继续轮询而不是把原始状态透传给下游。
 文档未提供真实 Key，首次配置后需要在后台填写渠道默认密钥，或通过下游 Bearer Key 透传上游 Key。
 
 在运行中的网关容器内执行配置脚本，以复用其实际数据库连接；脚本要求显式设置
 `EXPECTED_DB_HOST` 和 `EXPECTED_DB_NAME` 并核对连接，匹配已有记录时不会重复添加。
 配置脚本只创建渠道和模型，不发起付费生成请求。
+
+### 11.2 佳速 Seedance（seedance-2.0-900 / seedance-2.0-933 / seedance-2.5-101010）
+
+上游为佳速 `https://ai.jiasuapi.com/v1`，Bearer 鉴权，OpenAI 风格视频协议。
+
+- 提交：`POST /video/generations`；轮询：`GET /videos/tasks/{task_id}`。
+- 上游模型名分别为 `seedance-2.0-900`、`seedance-2.0-933`、`seedance-2.5-101010`，
+  三个逻辑模型名与上游真实模型名同名，`req_mapping` 中固定写死。
+  上游文档的创建示例里写的是 `seedance-2.5-301010`，但同一篇文档的响应示例是 `seedance-2.5-101010`，
+  以前者为准会失败；这里按响应示例与 `GET /v1/models` 的结果使用 `seedance-2.5-101010`。
+- `seconds` 映射 `duration`；客户端未传 `duration` 时上游按模型 API 参数的默认值执行并按秒计费，
+  因此映射只在 `seconds` 存在时才写入 `duration`。
+- `aspect_ratio` 映射上游的 `ratio`，未传时默认 `16:9`；`resolution` 未传时默认 `720p`。
+- 参考素材格式为 URL 或 `{url, name?, type?}`，`name` 可在 `prompt` 中用 `@名称` 引用，
+  网关按原样透传，不做改写。图片 `type` 可选 `first_frame` / `end_frame`。
+- `seedance-2.0-900` 只支持参考图 `images`，绑定不映射 `videos` 与 `audios`；
+  `seedance-2.0-933` 和 `seedance-2.5-101010` 额外支持参考视频 `videos` 与参考音频 `audios`。
+- 提交响应使用顶层 `id`（同时兼容 `task_id`）作为上游任务号；状态枚举为
+  `queued` / `in_progress` / `completed` / `failed` / `unknown`，
+  映射时把 `in_progress` 归一为 `processing`、`unknown` 归一为 `queued`。
+- 完成结果为 `result_urls` 数组，`poll_mapping` 取首项映射为 `video_url` 与 `object`，同时保留 `result_url`。
+- 结果链接是 `m.jiasuapi.com` 公开 CDN 直链，因此绑定保持“返回直链”，`proxy_content = 0`。
+- 素材上传接口（`/v1/uploads` 一类）是上游免费工具，本网关不封装；需要 `name` 引用时，
+  下游可直接把上游可访问的 URL 传入 `images` / `videos` / `audios`。
+
+模板与可复用的映射位于 `scripts/jiasu-seedance-config.js`，
+配置脚本为 `scripts/add-jiasu-seedance.js`，用法与 11.1 相同。
+脚本只在本地库执行时同样要求显式设置 `EXPECTED_DB_HOST` 和 `EXPECTED_DB_NAME`，
+核对连接后才会写入；重复执行不会重复添加。
+上游文档未提供真实 Key，渠道以 `api_key = NULL` 创建，
+首次配置后需要在后台填写渠道默认密钥，或通过下游 Bearer Key 透传上游 Key。
+映射表达式可用 `node --test test/jiasu-seedance.test.js` 校验，不需要发起付费生成请求。
+
+### 11.3 MCNIO GPT Image 2.5 Sunburst / Flare（gpt-image-2.5-2k / gpt-image-2.5-4k）
+
+上游复用已存在的渠道 `MCNIO GPT Image`（`https://api.mcnio.com`，Bearer），
+统一入口 `POST /v1/chat/completions`，同步返回，不走轮询。
+
+上游是「固定规格模型名」平台：分辨率和比例都写在模型名里，形如
+`gpt-image-2.5-sunburst-{分辨率}-{比例}` 与 `gpt-image-2.5-flare-{分辨率}-{比例}`，
+分辨率 `1k` / `2k` / `4k`，比例 `1x1` / `16x9` / `9x16` / `21x9` / `4x3` / `3x2` / `3x4` / `2x3` / `5x4` / `4x5`。
+上游文档要求「渠道只配 60 个固定规格名，不要只配短名」，并明确请求里不要传 `quality`（会返回 400，
+默认质量 `medium`），也不要传 `duration`、`aspect_ratio`、`resolution`、`size`、`width`、`height`。
+
+本网关没有把 60 个固定规格名全部暴露给下游，只按分辨率分档暴露两个逻辑模型，比例由下游传：
+
+- `gpt-image-2.5-2k`：下游只传 `model` 和 `size`（比例，`16:9` 或 `16x9` 都接受，缺省 `1x1`），
+  `req_mapping` 拼成上游 `gpt-image-2.5-sunburst-2k-{比例}`。
+- `gpt-image-2.5-4k`：同上，拼成 `gpt-image-2.5-sunburst-4k-{比例}`。
+- 默认变体是 Sunburst；需要 Flare 时下游额外传 `variant: "flare"`，
+  或直接把完整上游模型名放进 `model`（例如 `gpt-image-2.5-flare-2k-16x9`），网关会按原名透传。
+- 未接入 `1k` 档（上游 1K 名仍然存在，按需再加一条逻辑模型即可，映射生成函数按档位参数化）。
+- 白名单外的比例会归一成 `:`/`/` 换成 `x` 的形式交给上游判断，不做二次校验。
+
+图生图直接把 `images` 展开进消息：文字提示词作为 `messages[0].content` 的第一个 `text` 段，
+每张参考图各占一个独立的 `image_url` 段（上游支持 1~6 张，URL / data URL / base64 均可）。
+没有有效参考图时 `content` 退化为纯文本，走文生图。
+
+上游把结果放在 `choices[0].message.content`，常见形式是 Markdown 图片
+`![Generated Image](https://img.mcnio.com/generated/xxx.png)`；
+`resp_mapping` 把它归一到顶层 `url`（同时保留 `data[0].url`），
+data URL 结果额外给出 `b64_json`。上游若按 OpenAI 图像接口返回 `data[0].url` 也兼容。
+
+模板与映射位于 `scripts/mcnio-gpt-image-25-config.js`，配置脚本为 `scripts/add-mcnio-gpt-image-25.js`：
+脚本默认 `--dry-run` 只打印将写入的内容，`--apply` 才写入；要求显式设置
+`EXPECTED_DB_HOST` 和 `EXPECTED_DB_NAME` 并核对连接，复用已有渠道，重复执行不会重复添加。
+映射可用 `node --test test/mcnio-gpt-image-25.test.js` 校验，不需要发起付费生成请求。
+
+本仓库的 JSONata 是 2.2.2，写映射时注意两点：没有 `$isObject` / `$isArray`（用 `$type(x) = "object"` /
+`$type(x) = "array"` 判断），传给 `$filter` / `$map` 的匿名函数体只能是单个表达式，不能在里面写
+`$v := ...;` 形式的赋值语句。表达式里也不能写 `//` 注释（解析器会把 `/` 当运算符），说明写在 JS 注释里。
+
+### 11.4 klong.lat GPT Image 2（gpt-image-2 第二渠道）
+
+上游 `https://api.klong.lat`，Bearer 鉴权，OpenAI 兼容。上游真实模型名就是 `gpt-image-2`，
+`GET /v1/models` 声明它支持 `openai`、`image-generation`、`image-edits` 三种入口。
+
+本渠道不新增逻辑模型，而是复用既有 `gpt-image-2`，作为渠道「gpt图片生成」
+（`http://154.9.235.100:3006`）之外的第二条绑定：两个渠道共用**完全相同**的
+`req_mapping` / `resp_mapping`，只有 `base_url` 与密钥不同，下游看到的请求与返回格式不变，
+多绑定之间按 `weight` 随机路由。两条映射由 `scripts/sync-gpt-image-2-mapping.js`
+统一同步，改一处即可让两个渠道同时生效。
+
+#### 下游支持的两种请求形态
+
+映射同时兼容下面两种形态，下游不必改写：
+
+**形态 1：网关统一模板**（`POST /v1/images/generations` 或 `/v1/images/edits`）
+
+```json
+{
+  "model": "gpt-image-2",
+  "prompt": "一只在月光下的猫，插画风格",
+  "size": "16:9",
+  "quality": "high",
+  "n": 1,
+  "response_format": "url",
+  "images": ["data:image/png;base64,..."]
+}
+```
+
+**形态 2：OpenAI 原生 `POST /v1/chat/completions`**
+
+```json
+{
+  "model": "gpt-image-2",
+  "response_format": {"type": "url"},
+  "size": "1792x1024",
+  "quality": "high",
+  "n": 1,
+  "messages": [{"role": "user", "content": "生成一张城市夜景"}]
+}
+```
+
+图生图时 `messages[0].content` 换成数组，参考图放在 `image_url` 段：
+
+```json
+{
+  "model": "gpt-image-2",
+  "size": "1792x1024",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "参考这几张图片融合成城市夜景"},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+    ]
+  }]
+}
+```
+
+映射规则：
+
+- 提示词来源优先级：顶层 `prompt` > `messages[0].content`（字符串）>
+  `content` 数组里 `type=text` 的段（多段用空格拼接，空白段忽略）> 顶层 `text`。
+- 参考图来源：顶层 `images` 与 `content` 数组里的 `image_url.url` **合并**；
+  元素可以是 URL/data URL 字符串，也可以是 `{ "url": ... }` 对象；空值被过滤。
+- 无参考图 → 上游 `POST /v1/chat/completions`（提示词进 `messages[0].content`）。
+- 有参考图 → 上游 `POST /v1/images/edits` multipart，`image` 字段可重复；
+  该分支**不会**把 `messages` 带给上游（上游 edits 接口不接受 `messages`）。
+- `size` 支持画幅 `16:9` / `9:16` / `1:1` / `4:3` / `3:4`，换算成
+  `1792x1024` / `1024x1792` / `1024x1024` / `1536x1152` / `1152x1536`；
+  其他值（如 `1792x1024` 本身）原样透传，缺省 `1024x1024`。
+- `quality` 缺省 `high`，`n` 缺省 `1`。**下游不带 `quality`、传空串/空白、或传 `null`
+  时，网关都会强制补成 `"high"`**，不会把 `null` 或空值透传给上游。
+- `response_format` 下游传字符串 `"url"` 或对象 `{"type":"url"}` **都可以**，
+  网关统一归一成上游要求的**字符串**；缺省 `url`（`null` / 空对象也回落 `url`）。
+- 返回归一到顶层 `url`：兼容 OpenAI 风格 `data[0].url` 与 chat/completions 的
+  Markdown 图片 `choices[0].message.content`。
+
+注意：网关只解析 JSON 请求体（`express.json`），**不接受下游直接发 multipart**。
+下游如果自己拼 `multipart/form-data` 打 `/v1/images/edits`，`req.body` 为空、
+`req.body.model` 为 `undefined`，网关会在选绑定时抛
+`Bind parameters must not contain undefined` 并返回 500。参考图请走 JSON 里的
+`images` 数组或 `image_url` 段。
+
+实测要点（2026-10）：
+
+- 上游把 `response_format.type` 声明成 **string**。传统写法传 `{"type":"url"}` 会被上游
+  400 拒绝：`json: cannot unmarshal object into Go struct field ResponseFormat.response_format.type of type string`。
+  这就是本渠道必须把对象归一成字符串的原因；`/v1/images/generations`、`/v1/chat/completions`、
+  `/v1/images/edits` 三个上游入口都要求字符串。
+- 写这个映射时踩到两个 JSONata 2.2.2 的坑，改映射时注意：
+  1. 表达式里**不能写 `//` 注释**（会被当成正则起始符，抛
+     `Empty regular expressions are not allowed`），说明只能写在模板字符串外面；
+  2. `and` / `or` **不会短路**，`$type(x) = "string" and $trim(x) != ""` 里即使
+     `$type(x)` 不是字符串，`$trim(x)` 也会被求值并对 null 抛错。
+     缺省值判断要用嵌套三元（先判类型再判内容），别用 `and` 串联。
+- chat/completions 与 images/edits 都可能直接返回 `data:image/...;base64,...` 的 data URL，
+  此时顶层 `url` 就是该 data URL，下游按 URL 或 base64 处理都可以。
+- 参考图必须是真实可解码的图片，否则上游返回
+  `{"detail":"We couldn't process this image. Error code: image_parse_error."}`（HTTP 400）；
+  1×1 占位图也会被拒。
+- 上游 `/v1/images/edits` 只接受 HTTPS 参考图 URL 或 data URL / base64；
+  网关 multipart 构造对 `http://` 参考图会直接报错。
+
+模板与映射位于 `scripts/klong-gpt-image-2-config.js`，配置脚本为
+`scripts/add-klong-gpt-image-2.js`（`--dry-run` 预览 / `--apply` 写入，要求显式设置
+`EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME`，复用既有渠道与逻辑模型，重复执行不重复添加；
+渠道已有密钥时不覆盖）。渠道默认密钥写在配置文件里，可用环境变量 `KLONG_API_KEY` 覆盖。
+映射改动后用 `scripts/sync-gpt-image-2-mapping.js --dry-run` / `--apply` 同步到
+「gpt图片生成」、「gpt图片生成 Klong」与「gpt图片生成 688」三个绑定
+（688 只同步 `req_mapping`，它有自己的扩展 `resp_mapping`，见 11.6 节）。
+脚本用 `legacy_req_mappings`
+（配置文件里记录的历史版本名单）判断绑定是否「同源」，**每次改完 `req_mapping`
+必须把被替换掉的版本追加进 `legacy_req_mappings`**，否则下一次同步会因为对不上而跳过；
+脚本不会修改 `status` 与 `weight`，也不会重新启用已停用的绑定。
+映射可用 `node --test test/klong-gpt-image-2.test.js` 校验，不需要发起付费生成请求；
+端到端可用 `node tools/verify-klong-formats.js <网关地址> <网关密钥>` 跑四种形态。
+
+#### 部署注意：网关容器必须能校验证书
+
+HTTPS 渠道依赖容器内的 CA 证书库。本仓库 `Dockerfile` 使用
+`FROM node:20-bookworm-slim`，该镜像**不含 `ca-certificates`**，
+表现为容器内 `/etc/ssl/certs` 不存在、所有 HTTPS 上游报
+`UNABLE_TO_VERIFY_LEAF_SIGNATURE`（`unable to verify the first certificate`）。
+此时网关上任何 `https://` 渠道都会失败，而 `http://` 渠道正常。
+自建镜像请在 `Dockerfile` 里补上：
+`RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*`。
+
+### 11.5 snumom 万相 3.0 图生高速（wan3.0-image-prime）
+
+上游复用已有渠道 `Grok Video`（`https://snumom.com`，Bearer），异步视频流程：
+
+- 创建：`POST /v1/videos`；轮询：`GET /v1/videos/{task_id}`；下载：`GET /v1/videos/{task_id}/content`。
+- 上游模型名与逻辑模型名同名，`req_mapping` 中固定为 `wan3.0-image-prime`。
+- 上游请求是扁平 OpenAI 风格：`model` / `prompt` / `seconds`（兼容 `duration`）/ `size` / `aspect_ratio`
+  / `reference_images[{url, role}]` / `reference_audios[{url}]` / `prompt_extend` / `parameters` / `input.media`。
+
+字段映射：
+
+- 下游 `seconds` 映射上游 `seconds`，必须显式给出且在 `[2,30]` 内；缺失、`-1`、`0`、`1`、`31+`
+  或非数字一律回落到 **5 秒**（上游禁止 `-1` 智能时长，创建时按秒预扣）。
+  上游 `seconds` 字段在 Go 结构体里是 **string**，传数字会被上游拒绝并返回
+  `invalid_json` / `cannot unmarshal number into Go struct field .Alias.seconds of type string`，
+  因此网关内部用 `$number` 校验区间后再 `$string($round(...))` 发回整数字符串（例如 `"10"`）。
+- 下游 `resolution` 映射上游 `size`，取值 `480P` / `720P` / `1080P`；缺失或非法值回落到 **1080P**
+  （上游默认也是 1080P，计费按档位：480P $0.15/s、720P $0.18/s、1080P $0.20/s，仅按输出时长）。
+- 下游 `aspect_ratio` 透传，缺失时默认 `adaptive`（首帧模式推荐值）。
+- 下游 `images` 映射 `reference_images`：字符串项补 `role: reference_image`，
+  对象项保留 `url` 与 `role`（`first_frame` / `last_frame`）；最多 10 张，图片不计费。
+- 下游 `audios` 映射 `reference_audios`（最多 5 段，不计费）。
+- 下游 `videos` **不映射**：`wan3.0-image*` 上游禁止 `reference_videos` 和 video 类型的 `input.media`。
+- 顶层 `prompt_extend` 或 `parameters.prompt_extend` 都可用来关闭上游提示词智能改写（默认开启）；
+  下游 `input`（百炼原生 `input.media`，用于 `file` / `link` 文档网页参考）原样透传。
+
+上游返回与轮询：
+
+- 创建响应 `id` / `object` / `status`，`resp_mapping` 输出 `task_id`（缺省取 `id`）。
+- 轮询状态 `queued` / `not_start` → `queued`，`in_progress` → `processing`，`completed` / `failed` 保持；
+  无法识别的状态归一为 `processing`，不会把原始状态透传给下游。
+- 成片地址在上游 `metadata.url`（兼容 `video_url` / `result_url` / `url`），映射为 `video_url` 与 `object`；
+  失败时输出 `failed` 并带上 `error` / `message`。
+- 上游 `progress` 只有 `0` / `30` / `100` 的粗粒度值，生成通常 1~5 分钟，`progress: 30` 不代表卡死，
+  轮询间隔建议 10~15 秒。绑定开启了 `poll_throttle`，避免下游高频轮询打爆上游。
+- 成片 URL 24 小时后失效，因此绑定开启 `proxy_content`，由网关 `/v1/videos/{task_id}/content` 代理取流。
+
+模板与映射位于 `scripts/snumom-wan3-image-prime-config.js`，配置脚本为
+`scripts/add-snumom-wan3-image-prime.js`（`--dry-run` 预览 / `--apply` 写入，要求显式设置
+`EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME`，复用已有渠道、重复执行不重复添加，不覆盖渠道已有密钥）。
+映射可用 `node --test test/snumom-wan3-image-prime.test.js` 校验，不需要发起付费生成请求。
+
+### 11.6 688 图片渠道 GPT Image 2（gpt图片生成 688）
+
+上游 `https://img.688.qzz.io`，Bearer 鉴权，OpenAI 兼容图片服务。
+`GET /v1/models` 返回 `gpt-image-2`、`gpt-image-2.5`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`，
+声明入口 `["image-generation", "openai"]`。
+
+本渠道复用既有逻辑模型 `gpt-image-2`，作为「gpt图片生成」（`http://154.9.235.100:3006`）、
+「gpt图片生成 Klong」（`https://api.klong.lat`）之外的另一条绑定：三者共用**完全相同**的
+`req_mapping`，下游请求与返回格式不变，多绑定之间按 `weight` 随机路由。
+
+#### 请求形态
+
+与「gpt图片生成」逐字相同，下游两种形态都支持：
+
+- 无参考图 → 上游 `POST /v1/chat/completions`：`model` 固定 `gpt-image-2`，
+  `response_format` 是 `{"type":"url"}` 对象，`messages[0].content` 是提示词字符串。
+- 有参考图 → 上游 `POST /v1/images/edits` multipart：`image` 字段可重复，
+  该分支不发送 `messages`。
+
+`size` 画幅换算、`quality` 缺省 `high`、`n` 缺省 `1`、`response_format` 归一成字符串等规则
+与 11.4 节完全一致（同一份映射）。
+
+#### 返回形态与 base64 转链接
+
+`resp_mapping` 在 Klong 那版基础上扩展，把下面这些形态都归一到顶层 `url`（同时保留
+`b64_json` 与 `data[0]`）：
+
+- OpenAI 风格 `data[0].url` / `data[0].b64_json`（含 `image.data[0].*`、`image.url`、`image_urls[]`）。
+- `choices[0].message.content` 里的 Markdown 图片 `![alt](https://...)`。
+- `choices[0].message.content` 直接是 `data:image/...` 或裸 base64。
+- `content` 是数组时取其中的文本段。
+
+上游按 base64 返回图片，因此本渠道把渠道开关 `convert_resp_base64_to_url` 设为 `1`：
+网关在响应映射之后把 `data:image/...`、裸 base64 与 Markdown 里的 data URL 上传到
+图床（Zipline `files.mmg.lat`，见第 5 节「图床」），换成 HTTPS 链接再返回下游。
+下游看到的 `url` 永远是 http 链接，与「gpt图片生成」渠道一致；上游返回的本来就是链接时不做改动。
+
+限流时上游会回 HTTP 429 `上游返回频率限制，请稍后重试`，或 200 + `choices[0].message.content`
+里的一句「未能生成图片」错误话术。后者**不会**被当成图片：映射只在 content 是 Markdown 图片、
+data URL 或整段裸 base64 时才把它填进 `url`，否则 `url` 为空字符串。
+
+#### 响应侧转换的实现要点（server.js）
+
+- `tryConvertResponseImages(responseBody, binding)` 在 `sendMappedPost` 里紧接 `resp_mapping` 之后执行，
+  只有 `channels.convert_resp_base64_to_url = 1` 的绑定才会进入递归遍历；开关为 `0` 时行为与以前完全一致。
+- 裸 base64 只认图片字段名（`b64_json`/`base64`/`image_base64`/`images`/`image_urls`/`image`/`url`/`data`/`content`）
+  且长度 ≥128、字符集为 base64 的字符串，避免把提示词或错误话术上传成图片。
+- 图床对所有上传都返回 `.png` 链接；链接本身没带扩展名时，网关按 base64 头部嗅探补上
+  `.jpg`/`.gif`/`.webp`/`.png`（`withTruthfulExtension`）。
+- 上传失败只记日志并原样返回上游结果，不会把一次成功的生成变成 500。
+- Markdown 包装会被剥掉：返回给下游的是裸链接，而不是 `![alt](...)`。
+
+#### 实测与配置
+
+- 2026-10 实测：该密钥在连续调用时会上游限流，四种入口（chat/completions、
+  images/generations、images/edits、带/不带 response_format）都返回 HTTP 429，
+  限流恢复后重试即可。`tools/probe-688-upstream.js` 用于重新探测真实返回结构。
+- 因为上游额度不可用时无法连真实上游验证返回形态，仓库提供本地 mock 上游
+  `tools/mock-img688-upstream.js` 与端到端校验脚本 `tools/verify-img688-pipeline.js`
+  （会临时建一个指向 mock 的渠道与绑定，跑完删除并恢复其它绑定状态）。
+  当前 13 项检查全部通过，覆盖：data URL 文生图、带参考图的 images/edits multipart、
+  Markdown 里的 data URL、http 链接原样返回、限流错误话术不产生假链接、返回体不含 base64、
+  以及图床链接可下载。
+- 模板与映射位于 `scripts/img688-gpt-image-2-config.js`，配置脚本为
+  `scripts/add-img688-gpt-image-2.js`（`--dry-run` 预览 / `--apply` 写入，要求显式设置
+  `EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME`，复用既有渠道与逻辑模型，重复执行不重复添加；
+  渠道已有密钥时不覆盖）。渠道默认密钥写在配置文件里，可用环境变量 `IMG688_API_KEY` 覆盖。
+- 映射可用 `node --test test/img688-gpt-image-2.test.js` 校验，不需要发起付费生成请求。
+- `scripts/sync-gpt-image-2-mapping.js` 会把 Klong 的 `req_mapping` 同步到 688 绑定上，
+  但**不会**把 688 的 `resp_mapping` 覆盖成 Klong 那版；改动 Klong 的 `req_mapping` 时，
+  如果 688 的历史版本需要登记，追加到 `img688-gpt-image-2-config.js` 的 `legacy_req_mappings`。
+
+### 11.7 Vylai SD 2.0 Fast（75api-sd20-fast-20260919 / seedance-2.0-933-480p / seedance-2.0-933-720p）
+
+复用 11.1 的既有渠道 `Vylai MiniMax H3`（`https://queueapi.vylai.com`，`x-auth-token`），
+不新建渠道：同一个 Key 同时覆盖 `75api-minimax-h3-*` 与 `75api-sd20-fast-20260919` 两类模板。
+上游文档是「SD 2.0 Fast / Wan 3.0 视频生成 OpenAPI 调用说明」，本文只接入 SD 2.0 Fast 模板。
+
+同一上游模板下暴露三个逻辑模型，区别只在 `config_values.resolution` 的来源：
+
+| 逻辑模型名 | resolution 来源 | 说明 |
+|---|---|---|
+| `75api-sd20-fast-20260919` | 下游传 `resolution` | 通用入口；支持 `480p` / `720p`，非法值回落 `480p` |
+| `seedance-2.0-933-480p` | 由模型名写死 `480p` | 下游传任何 `resolution` 都被忽略 |
+| `seedance-2.0-933-720p` | 由模型名写死 `720p` | 下游传任何 `resolution` 都被忽略 |
+
+下游需要按模型名区分分辨率时用后两个（例如插件只按模型名选档，不解析额外参数）；
+两档之外不需要新模型，加一条 `NAMED_MODELS` 记录即可（`scripts/vylai-sd20-fast-config.js`）。
+三个模型共用同一份创建路径、轮询路径与轮询映射，`resp_mapping` / `poll_mapping` 里的
+`model` 字段各自写自己的逻辑模型名。
+
+- 创建：`POST /openapi/tasks/create`；轮询：`GET /openapi/tasks/{task_id}`（与 11.1 相同）。
+- 上游模板名 `75api-sd20-fast-20260919` 在 `req_mapping` 里固定写死，三个模型完全相同。
+- 创建成功要求 HTTP 200 且 `data.task_id` 非空（`resp_mapping` 只取 `data.task_id`，取不到时
+  网关返回 502，不会凭空造任务号）。
+- 状态 `pending` / `preparing` / `running` 归一为 `queued` / `processing`，
+  `completed` / `failed` / `canceled` 分别归一为 `completed` / `failed` / `failed`；
+  完成结果取 `data.result_oss_url`，实测可能是 `oss.vylai.com` 也可能是 `vod.villai.cn`，
+  都是无需鉴权的公开直链，因此绑定保持「返回直链」（`proxy_content = 0`）。
+- 轮询映射直接复用 11.1 的 `buildPollMapping`（由 `scripts/vylai-minimax-config.js` 导出），
+  所以「上游出错字段不固定」「响应没有 `data` 包装」「错误状态仍停在 running」等兜底规则与
+  MiniMax H3 完全一致。
+
+字段映射（与 11.1 的差异都在创建请求里）：
+
+| 下游字段 | 上游字段 | 说明 |
+|---|---|---|
+| `prompt` | `extra_data.text` | 必填 |
+| `seconds` | `config_values.duration` | 4–15 的整数秒，默认 `5`；小数先四舍五入，越界回落 `5` |
+| `resolution` | `config_values.resolution` | 只有 `480p` / `720p`（**小写 p**）；通用模型非法值回落 `480p`，带分辨率的模型由模型名写死 |
+| `aspect_ratio` | `config_values.ratio` | 只有 `9:16` / `16:9`，非法值回落 `9:16` |
+| `images` | `image_path` | 最多 9 张，`$count(images) > 0` 时才下发 |
+| `audios` | `audio_path` | 最多 3 个，未传不下发 |
+| `videos` | `video_path` | 最多 3 个，用途随 `mode` 变化，未传不下发 |
+| `mode`（下游扩展字段） | `config_values.mode` | 默认 `reference`（多模态参考生）；可选 `t2v` / `first_frame` / `first_last`，非法值回落 `reference` |
+| — | `config_values.watermark` | 固定 `false` |
+| — | `config_values.generate_audio` | 固定 `true` |
+| — | `priority` | 固定 `0` |
+
+注意点：
+
+- SD 2.0 Fast 用的是 `config_values.ratio` 与 `resolution: "480p"/"720p"`，
+  而 11.1 的 MiniMax H3 用 `config_values.aspect` 且不声明 `mode`，两者不能共用一份 `req_mapping`。
+- `config_values` 只允许模板已声明的字段，传未知字段上游直接返回 400「未知配置字段」，
+  因此 `req_mapping` 只输出上表字段；`watermark` / `generate_audio` 这类下游可能顺手传的字段
+  会被忽略并强制回落到固定值。
+- `mode` 与素材必须匹配：`t2v` / `first_frame` / `first_last` 不允许参考音频或参考视频，
+  `first_frame` 至少 1 张图片、`first_last` 至少 2 张图片、`reference` 可组合图片 / 音频 / 视频。
+  上游在任务执行阶段才会以 `failed` + `error_message` 报出这类问题，映射会把
+  `error_message` / `display_error_message` 归一成终态 `failed`。
+- 上游**拒绝 `data:` 内联 Base64**。渠道已开启 `convert_base64_to_url = 1`，网关提交前会把
+  请求体里的 `data:image/...;base64,...` 转成图床 HTTPS 链接，所以下游传 base64 图片可用；
+  音频与视频没有对应的转换，必须是公网 `http(s)` URL 或上传接口返回的 COS 相对路径。
+- 素材也可以先走上游上传接口（`POST /openapi/upload/presign` + 按 `required_headers` PUT），
+  本网关不封装这一步；有公网 URL 时直接传 URL 即可。
+- 需要参考视频时把上游可访问的视频 URL 放进下游 `videos`（映射为 `video_path`），
+  并在 `mode` 上传 `reference`。
+- 写映射时踩到的 JSONata 2.2.2 坑：**表达式里不能写 `//` 注释**，否则解析器把 `/` 当成
+  正则起始符并抛 `Empty regular expressions are not allowed`（说明只能写在模板字符串外面）。
+
+模板与映射位于 `scripts/vylai-sd20-fast-config.js`（`buildModel` / `buildReqMapping` 生成三个模型，
+`NAMED_MODELS` 里登记带分辨率的逻辑模型名；要再加档位只加一条记录即可），
+配置脚本为 `scripts/add-vylai-sd20-fast.js`
+（`--dry-run` 预览 / `--apply` 写入，要求显式设置 `EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME` 并核对连接；
+复用既有渠道，不新建渠道、不覆盖渠道密钥、不删除既有绑定，重复执行只更新差异字段，一次跑完三个模型）。
+首次配置后需要在渠道里填写上游密钥，或由下游透传上游 Key。
+映射可用 `node --test test/vylai-sd20-fast.test.js` 校验（含「下游传任意 resolution 都不改变写死档位」
+的用例），不需要发起付费生成请求。
+
+2026-10 实测：先用本地 mock 上游经真实网关容器跑通全链路（未消耗上游额度）——创建返回网关任务号、
+轮询 `queued → processing → completed`、`video_url` 取到 `data.result_oss_url`。mock 收到的那次请求
+（下游传 `resolution=720p`、`seconds=8`、两张图）证明字段逐个按上表落地，请求体为
+`{"template_key":"75api-sd20-fast-20260919","extra_data":{"text":...},"config_values":{"mode":"reference","duration":8,"resolution":"720p","ratio":"16:9","watermark":false,"generate_audio":true},"priority":0,"image_path":[...]}`，
+鉴权头为 `X-Auth-Token`。随后又用真实上游跑了一条最便宜的 `mode=t2v`、`duration=4`、`resolution=480p`
+任务验证：该渠道 Key **已被授权调用 SD 2.0 Fast 模板**，创建返回 `data.task_id`（上游任务号 `4121219`），
+约 100 秒后状态 `completed`，`video_url` 为
+`https://oss.vylai.com/sd/.../4121219_..._1.mp4`，直链 HEAD 返回 `200 video/mp4`（847 KB，无需鉴权，
+所以 `proxy_content = 0` 正确），`GET /v1/videos/{id}/content` 返回该直链。
+同样的方式对 `seedance-2.0-933-480p` 与 `seedance-2.0-933-720p` 各跑了一条 `mode=t2v`、`duration=4`、
+不传 `resolution` 的真实任务，两者都创建成功并走到 `completed`；用 ffprobe 读成品确认档位确实按模型名生效：
+480p 档输出 `864x496`（752 KB），720p 档输出 `1280x720`（2.8 MB），成片时长都是约 4.1 秒。
+另外实测结果直链的域名并不固定（既有 `oss.vylai.com` 也有 `vod.villai.cn`），两个域名都是无需鉴权的公开
+`video/mp4` 直链，因此 `proxy_content = 0`（返回直链）对两个档位都成立。
+
+### 11.8 AI 创作 Seedance 2.0 Fast（Seedance 2.0 Fast）
+
+上游是「AI 创作」站点的 OpenAI 兼容媒体生成 API（文档为站点 `/api-guide` 页面），
+新建渠道 `AI 创作`（`http://116.211.150.21:3000`，Bearer 鉴权），异步视频流程：
+
+- 提交：`POST /v1/videos/generations`；轮询：`GET /v1/tasks/{task_id}`；下载：`GET /v1/tasks/{task_id}/download`。
+- 上游模型清单由 `GET /v1/models` 给出，当前为 `Seedance 2.0 Fast`、`Seedance Auto`、
+  `doubao-video`、`dola-video`（文档正文的模型表已过时，仍写着 `doubao-image` / `dola-image`）。
+  本次只按下游文档接入了 `Seedance 2.0 Fast`，其余三个上游模型没有建逻辑模型，需要时按本节配置方式补即可。
+- `wait=false` 时上游返回 HTTP 202 与上游任务号；网关按统一下游模板返回自己的 `gw_task_id`。
+
+字段映射：
+
+| 下游字段 | 上游字段 | 说明 |
+|---|---|---|
+| `prompt` | `prompt` | 必填，最多 5000 字符 |
+| `seconds` | `seconds` | 只支持 `5` / `10` / `15`（统一计费）；缺失、`0`、`-1`、小数、非数字、空串一律回落 **5** |
+| `aspect_ratio` | `aspect_ratio` | 透传，文档示例 `16:9` / `9:16` / `1:1` |
+| `images` | `image_urls` | 最多 10 张，需上游可访问的公网 URL 或 data URL；为空数组时不下发 |
+| — | `wait` | 固定 `false`，网关始终走异步流程 |
+| `resolution` | — | 上游没有该字段，被忽略；目前 `Seedance 2.0 Fast` 的画幅由 `aspect_ratio` 决定 |
+| `videos` / `audios` | — | 上游不支持参考视频与参考音频，不映射 |
+
+`seconds` 用 `$type` + `/^[0-9]+$/` 先确认可取数，再取 `[5,10,15]` 内值或回落 5。
+
+上游返回与轮询：
+
+- 创建响应（HTTP 202）为 `{task_id, status: "pending", model, object: "video.generation", created, billing} `，
+  `resp_mapping` 取 `task_id`（兼容 `id` / `data.task_id`）。
+- 轮询 `status` 为 `pending` / `processing` / `completed` / `failed`：`pending` → `queued`，
+  其他无法识别的状态归一为 `processing`，不会把原始状态透传给下游。
+- 上游 `progress` 是 `"30%"` 这样的**字符串**，映射时去掉 `%` 再转数字；完成时固定 `100`。
+- 上游 `created_at` / `completed_at` 是 **ISO 8601 字符串**（`2026-10-07T05:51:55Z`），
+  用 `$toMillis(...) / 1000` 转成 Unix 秒；`completed_at` 在非完成态为空串，映射输出 `null`。
+- 完成后结果地址的形态**不固定**：有时是站内相对路径（`/v1/tasks/task_xxx/download`），
+  有时是第三方 CDN 直链（实测见过 `https://v3-videoweb.doubao.com/...`，带签名与过期参数）。
+  第三方直链实测出现过 `403 Forbidden`（网关代理取流因此返回
+  `{"error":"Upstream video content request failed","upstream_status":403}`），
+  而同一任务的 `{base_url}/v1/tasks/{task_id}/download` 始终返回 `200 video/mp4`。
+  因此 `poll_mapping` 在完成态**优先用 poll 响应里的 `task_id` 拼站内下载地址**作为 `video_url`
+  （与渠道同源 → 网关代理自动带密钥；CDN 不可用时上游会重新取回），上游给的直链只保留在
+  `upstream_result_url` 里供排查。没有 `task_id` 时才退回上游给的地址（相对路径拼 `base_url`，
+  绝对地址原样透传）。
+- 只要响应里出现非空错误文本（`error`、`display_error_message`），无论 `status` 停在哪个进行中状态，
+  都落成终态 `failed` 并带上 `error`；完全没有状态、没有可读错误文本时才输出
+  `上游任务失败: <status>`，避免下游一直轮询。
+- 结果下载接口 **必须带 Bearer**，无鉴权返回 401，支持 `Range`；因此绑定开启 `proxy_content = 1`，
+  由网关 `/v1/videos/{task_id}/content` 代理取流（同源请求会带渠道密钥，Range 透传）。
+- 网关侧另有一层兜底：代理取流拿到 401/403 时，会再用 `{base_url}/v1/tasks/{up_task_id}/download`
+  重试一次（保留 Range 头），成功则正常返回视频并打日志
+  `[Gateway Video Proxy Fallback]`，避免已提交任务因为上游换了直链而永久打不开。
+
+注意点：
+
+- 渠道密钥已写入 `channels.api_key`，可用环境变量 `AICREATION_API_KEY` 覆盖；
+  脚本不会覆盖已存在渠道的密钥。
+- 上游文档建议 60 秒轮询一次；绑定开启 `poll_throttle`（网关侧最小间隔由
+  `POLL_MIN_INTERVAL_SECONDS` 控制，默认 6 秒），下游轮询建议 10~15 秒，别用高频轮询打上游。
+- 上游提交接口只认整数秒，传 `7` 会返回 `400 unsupported_model_duration`；
+  映射已经把非法值收敛到 5，所以下游传错时长不会失败，只会按 5 秒生成。
+- 写映射时再次踩到 JSONata 2.2.2 的坑：`$isFinite` 在这个版本里**不可用**
+  （`$isFinite(1)` 抛 `Attempted to invoke a non-function`），`$number("")`、`$number("abc")`、
+  `$number(null)` 会抛错且无法用三元兜住。判断「能不能转成数字」必须先用
+  `$type(x)` / `$match($string(x), /^[0-9]+$/)` 判断，再调用 `$number`。
+  另外 `$toMillis` 对非 ISO 字符串同样会抛错，必须先 `$contains(x, "T")`。
+
+模板与映射位于 `scripts/aicreation-seedance-fast-config.js`，配置脚本为
+`scripts/add-aicreation-seedance-fast.js`（`--dry-run` 预览 / `--apply` 写入，要求显式设置
+`EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME`；渠道按 `name` / `base_url` 复用，逻辑模型按
+`model_name` 复用，重复执行只更新差异字段）。
+映射可用 `node --test test/aicreation-seedance-fast.test.js` 校验，不需要发起付费生成请求；
+端到端可用 `node tools/verify-aicreation-seedance-fast.js <网关地址> <网关密钥>`（会真实创建一条 5 秒任务）。
+
+2026-10 实测（未走网关，直连上游）：`GET /v1/models` 在带 Bearer 时返回 200，缺头返回 401
+`invalid_token`；提交空 `prompt` 返回 400 `prompt_required`、`seconds=7` 返回
+400 `unsupported_model_duration`、未知模型返回 404 `model_not_found`，说明文档里的
+`/v1/videos/generations` 与 `/v1/tasks/{id}` 就是真实路径（`/v1/videos`、`/v1/video/generations` 都是 404）。
+一条 `seconds=5`、`aspect_ratio=16:9` 的真实任务：提交返回 HTTP 202 与 `task_id`，
+轮询 `pending → processing → completed`（`progress` 依次 `10%` / `30%` / `100%`，本条约 3 分钟），
+完成后 `url` / `urls[0]` / `download_url` 都是 `"/v1/tasks/task_xxx/download"` 相对路径；
+该地址 `HEAD` 返回 404、无鉴权 `GET` 返回 401、带 Bearer `GET` 返回 `200 video/mp4`
+（251 KB，`accept-ranges: bytes`），带 `Range` 返回 `206`，所以「拼绝对地址 + 网关代理取流」是必需的。
+
+失败态实测：经网关 `POST /v1/videos` 创建的一条 5 秒任务，上游在 `pending`/`processing` 之间来回约 21 分钟后
+返回 `status: "failed"`、`progress: "100%"`、`error: "所有可用账号均无法继续生成视频"`、
+`error_code: "provider_generation_start_timeout"`，`billing` 为 `refunded`（这属于上游账号池容量不足，
+不是映射问题，也不是网关侧失败）。网关轮询结果与上游逐字对应：
+`{"status":"failed","progress":100,"video_url":"","object":"video.generation",
+"error":"所有可用账号均无法继续生成视频","error_code":"provider_generation_start_timeout",
+"completed_at":1791353966}`，`completed_at` 由上游 ISO 时间 `2026-10-07T06:19:26Z` 转成 Unix 秒，
+下游拿到终态即停止轮询；该任务也把网关 `gateway_keys.used_quota` 归还（`updateTaskStatus` 的失败分支）。
+
+完成态端到端实测（一条下游真实请求，`seconds=15`、`aspect_ratio=16:9`、带 4 张 `@图N` 参考图）：
+经网关提交后轮询 `queued → processing → completed`（上游在 `pending` / `processing` 之间反复横跳约 9 分钟，
+`progress` 在 `0 / 10 / 20 / 30` 之间来回），完成时网关返回
+`status=completed`、`progress=100`、`video_url=http://<网关>/v1/videos/{id}/content`（代理地址）。
+`GET /v1/videos/{id}/content` 实测：整片返回 `200 video/mp4`（2382176 字节，`accept-ranges: bytes`），
+`Range: bytes=0-1023` 与 `bytes=1024-2047` 都返回 `206` 且 `content-range` 正确；
+下载后用 ffprobe 读成品为 `hevc 1280x720`、时长 `15.07s`，说明下游的 `seconds` 与 `aspect_ratio`
+确实按映射落到了上游（15 秒、16:9）。
+
+注意 `/content` 与 `/v1/videos/{id}` 共用同一套 `poll_throttle` 节流：距上次轮询不足
+`POLL_MIN_INTERVAL_SECONDS`（默认 6 秒）时，`/content` 会返回 `{"url":""}`（10 字节 JSON）而不是视频流，
+稍等几秒重试即可；浏览器/播放器正常播放不受影响（Range 请求本身就是分开的几次调用）。
+
+#### 按需转码：上游只给 HEVC 时的浏览器播放（`/content?format=h264`）
+
+上游（豆包系）返回的成片是 **HEVC / H.265**（实测容器 `isom`、视频轨 `hvc1`、1280x720、`moov` 在文件开头，
+即文件本身完全正常、可 Range 播放）。但 Chrome / Firefox 在多数环境下**无法解码 HEVC**，
+播放器表现就是一直停在 `0:00` 加载不出来——这不是取流问题，而是编码问题。
+上游不接受指定编码的参数（`codec` / `format` / `video_codec` / `resolution` 都会被忽略），
+所以只能在网关侧转码。
+
+网关提供按需转码，不改动已保存的任务地址：
+
+| 入口 | 行为 |
+|---|---|
+| `GET /v1/videos/{id}/content` | 原样透传上游编码（HEVC 时浏览器可能放不出来） |
+| `GET /v1/videos/{id}/content?format=h264` | 返回浏览器可播的 H.264/AAC mp4（首次请求触发转码并缓存） |
+| `GET /v1/videos/{id}/content?format=h264&download=1` | 同上，但用 `Content-Disposition: attachment` 下载 |
+| `GET /v1/videos/{id}/playback` | 报告该任务能否被浏览器直接播放，并给出 `browser_url`（H.264 地址） |
+
+实现要点：
+
+- `format` 取值为 `h264` / `avc` / `avc1` / `mp4`（大小写与空格容错）；不传 `format` 时行为与以前完全一致。
+- 转码用 `ffmpeg -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -tag:v avc1 -c:a aac -movflags +faststart`，
+  产物写进 `CONTENT_CACHE_DIR`（compose 里挂了 `content-cache` 卷），**每个任务只转一次**，
+  之后（含容器重启后）直接读本地文件，秒开且支持 Range / `If-None-Match`（304）。
+- 若上游某天返回的就是 H.264，则不做二次编码，直接把源文件发布进缓存（日志 `[Gateway H264 Passthrough]`）。
+- 同一任务并发请求共享一次转码（`[Gateway H264 Transcode Start]` / `... Done`）；
+  转码失败返回 502 `{"error":"H.264 transcoding failed","details":...}`，不会退化成 500 的 "Failed to poll upstream status"。
+- 非代理绑定（`proxy_content = 0`）请求 `?format=h264` 时返回同源网关链接
+  `{"url":".../content?format=h264"}`，由该链接完成转码，下游不需要自己拼参数。
+- 需要 `ffmpeg` / `ffprobe`，已加进 `Dockerfile`（`apt-get install ffmpeg`）。
+  可用 `FFMPEG_PATH` / `FFPROBE_PATH` 覆盖路径，`CONTENT_H264_CRF`、`CONTENT_H264_PRESET`、
+  `CONTENT_H264_AUDIO_BITRATE`、`CONTENT_H264_TIMEOUT_MS` 调整转码参数。
+- 首次播放要多等一次转码时间（15 秒 720p 素材约十几秒量级），之后都是本地文件；播放器/插件只要把地址
+  换成 `?format=h264` 即可，不需要改提交逻辑。
+
+
+取流稳定性实测与修复（`upstream_status: 403` 那次）：某条已完成任务，上游 poll 返回的 `url` / `urls[0]`
+是第三方直链 `https://v3-videoweb.doubao.com/...`，网关代理取流时该地址返回 `403 Forbidden`
+（带 Bearer 与不带 Bearer 都一样，带 Range 也一样，响应体是 Apache 风格的 403 HTML 页面），
+于是 `/content` 返回 `{"error":"Upstream video content request failed","upstream_status":403}`；
+同时该任务用 `up_task_id` 直连 `{base_url}/v1/tasks/{task_id}/download` 是 `200 video/mp4`、
+`Range` 返回 `206`，两者拿到的字节数完全一致（2031291 字节）。同一 CDN 直链过一段时间再访问又恢复 200，
+说明它是**间歇性拒绝**（签名/风控/热点保护类），不能作为取流地址依赖。
+修复动作有两层，都已落到当前配置：
+1. `poll_mapping` 完成态改为优先返回站内下载接口地址（新提交的任务从第一次轮询完成起就走它）；
+2. `server.js` 的 `proxyVideoContent` 增加兜底：401/403 时用站内下载地址重试一次，
+   成功则正常返回视频并打 `[Gateway Video Proxy Fallback]` 日志。
+修复后实测用户报的那条任务（`8451e57e-...`，用的是提交时保存的旧快照映射）取流恢复正常：
+`GET /v1/videos/{id}/content` 返回 `200 video/mp4`、2031291 字节、含 `ftyp` box。
