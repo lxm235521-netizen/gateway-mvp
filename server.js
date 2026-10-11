@@ -648,6 +648,76 @@ async function loadLegacyPollRuntime(taskRecord) {
     };
 }
 
+// Downstream contract for a video task is `error: { code, message }` (or null).
+// The shape is produced by each binding's poll_mapping JSONata, so older channel
+// configs still emit the legacy flat form (`error: "<text>"` plus a top-level
+// `error_code`). Normalizing here - rather than only in the mappings - also fixes
+// tasks whose poll_mapping_snapshot was frozen before a mapping was corrected.
+const VIDEO_ERROR_CODES = new Set([
+    "video_generation_failed",
+    "video_generation_cancelled",
+    "reference_image_download_failed",
+    "gpu_out_of_memory",
+    "content_moderation"
+]);
+
+function pickErrorText(value) {
+    if (typeof value === "string") {
+        return value.trim() || null;
+    }
+    if (!isObject(value)) {
+        return null;
+    }
+    for (const key of ["message", "msg", "error", "detail", "reason"]) {
+        const text = value[key];
+        if (typeof text === "string" && text.trim()) {
+            return text.trim();
+        }
+    }
+    return null;
+}
+
+function pickErrorCode(value) {
+    if (!isObject(value)) {
+        return null;
+    }
+    for (const key of ["code", "error_code", "type"]) {
+        const code = value[key];
+        if (typeof code === "string" && code.trim()) {
+            return code.trim();
+        }
+    }
+    return null;
+}
+
+function normalizeVideoError(pollResult) {
+    if (!isObject(pollResult)) {
+        return pollResult;
+    }
+
+    const raw = pollResult.error;
+    const message = pickErrorText(raw);
+    let code = pickErrorCode(raw);
+    if (!code) {
+        code = pickErrorCode({ code: pollResult.error_code, type: pollResult.error_type });
+    }
+
+    // A failed task must always describe itself; a non-failed one carries no error.
+    if (!message && pollResult.status !== "failed") {
+        pollResult.error = null;
+        pollResult.error_code = null;
+        return pollResult;
+    }
+
+    if (!VIDEO_ERROR_CODES.has(code)) {
+        code = "video_generation_failed";
+    }
+    pollResult.error = { code, message: message || "Video generation failed" };
+    // Keep the legacy flat field as a mirror so existing clients stay consistent.
+    pollResult.error_code = code;
+    return pollResult;
+}
+
 async function pollAsyncTask(taskRecord) {
     const runtime = (taskRecord.binding_id || taskRecord.upstream_base_url || taskRecord.poll_path_snapshot || taskRecord.poll_mapping_snapshot || taskRecord.upstream_api_key_snapshot)
         ? {
@@ -670,7 +740,7 @@ async function pollAsyncTask(taskRecord) {
         headers: buildAuthHeaders(runtime.upstream_key, runtime.auth_type)
     });
 
-    const pollResult = await executeMapping(runtime.poll_mapping, upstreamRes.data);
+    const pollResult = normalizeVideoError(await executeMapping(runtime.poll_mapping, upstreamRes.data));
     pollResult.id = taskRecord.gw_task_id;
     pollResult.task_id = taskRecord.gw_task_id;
     return pollResult;
@@ -1381,6 +1451,7 @@ module.exports = {
         isBrowserPlayableCodec,
         isTranscodeError,
         H264_FORMATS,
-        extractImageBedUrl
+        extractImageBedUrl,
+        normalizeVideoError
     }
 };

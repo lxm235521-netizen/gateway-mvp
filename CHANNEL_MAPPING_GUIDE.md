@@ -108,7 +108,44 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
+失败返回建议格式（`error` 必须是对象，不是字符串）：
+
+```json
+{
+  "created_at": 1785203530,
+  "completed_at": 1785203783,
+  "id": "task_gateway_id",
+  "model": "logical-model-name",
+  "object": "video.generation",
+  "progress": 100,
+  "status": "failed",
+  "task_id": "task_gateway_id",
+  "error": {
+    "code": "video_generation_failed",
+    "message": "Video generation failed"
+  }
+}
+```
+
+`error.code` 只保留语义白名单：`video_generation_failed`、`video_generation_cancelled`、
+`reference_image_download_failed`、`gpu_out_of_memory`、`content_moderation`。
+其余取值（包括上游自定义的 `error_code`，例如 `upstream_failed`）一律回落
+`video_generation_failed`，下游因此可以稳定按码分支。
+
 当前代码会在轮询后自动覆盖 `id` 和 `task_id` 为网关任务号。`poll_mapping` 只需要把上游状态、进度、错误和真实结果 URL 映射出来。
+
+`server.js` 在 `poll_mapping` 求值之后还会统一归一化 `error`，所以映射写得不规范也不会漏到下游：
+
+- 映射输出 `error` 为字符串（旧的扁平写法，错误码另放顶层 `error_code`）时，网关改写成
+  `{ code, message }`；`code` 缺失或不在白名单内时回落 `video_generation_failed`。
+- 映射输出 `error` 已是对象时，取其中的 `message` / `msg` / `error` / `detail` / `reason` 作为
+  `message`，取 `code` / `error_code` / `type` 作为 `code`，再按上面的白名单归一。
+- `status` 为 `failed` 但完全没有错误文本时，补 `message: "Video generation failed"`，
+  保证失败任务永远可读；非失败状态的 `error` 固定为 `null`（连带的顶层 `error_code` 也置 `null`）。
+- 顶层 `error_code` 保留为 `error.code` 的镜像，只读旧字段的下游不会与新字段产生分歧。
+
+关键：归一化发生在网关侧而不是映射里，因此提交时已冻结 `poll_mapping_snapshot` 的历史任务
+同样生效——只修 `poll_mapping` 不会改变旧任务的返回。
 
 重要：当前 `/v1/videos/{task_id}/content` 会读取 `poll_mapping` 结果中的 `video_url` 字段。因此如果上游完成后返回字段叫 `result_url`、`url`、`data[0].url` 等，必须在 `poll_mapping` 中映射为 `video_url`。
 
@@ -1064,10 +1101,14 @@ data URL 或整段裸 base64 时才把它填进 `url`，否则 `url` 为空字�
 失败态实测：经网关 `POST /v1/videos` 创建的一条 5 秒任务，上游在 `pending`/`processing` 之间来回约 21 分钟后
 返回 `status: "failed"`、`progress: "100%"`、`error: "所有可用账号均无法继续生成视频"`、
 `error_code: "provider_generation_start_timeout"`，`billing` 为 `refunded`（这属于上游账号池容量不足，
-不是映射问题，也不是网关侧失败）。网关轮询结果与上游逐字对应：
+不是映射问题，也不是网关侧失败）。映射把上游错误原样映出后，再由 `server.js` 的
+`normalizeVideoError` 归一成下游契约（见第 3 节）：`error` 变成对象，
+`provider_generation_start_timeout` 不在语义白名单内所以回落 `video_generation_failed`，
+顶层 `error_code` 保留为 `error.code` 的镜像：
 `{"status":"failed","progress":100,"video_url":"","object":"video.generation",
-"error":"所有可用账号均无法继续生成视频","error_code":"provider_generation_start_timeout",
-"completed_at":1791353966}`，`completed_at` 由上游 ISO 时间 `2026-10-07T06:19:26Z` 转成 Unix 秒，
+"error":{"code":"video_generation_failed","message":"所有可用账号均无法继续生成视频"},
+"error_code":"video_generation_failed","completed_at":1791353966}`，
+`completed_at` 由上游 ISO 时间 `2026-10-07T06:19:26Z` 转成 Unix 秒，
 下游拿到终态即停止轮询；该任务也把网关 `gateway_keys.used_quota` 归还（`updateTaskStatus` 的失败分支）。
 
 完成态端到端实测（一条下游真实请求，`seconds=15`、`aspect_ratio=16:9`、带 4 张 `@图N` 参考图）：
