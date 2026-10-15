@@ -32,7 +32,10 @@ const MULTIPART_META_KEYS = new Set([
     // /v1beta/models/{model}:generateContent?alt=sse) sets this so the gateway pipes the
     // upstream body through verbatim instead of buffering it and re-mapping the response.
     // It is gateway metadata and must never be forwarded upstream.
-    "_stream_passthrough"
+    "_stream_passthrough",
+    // Optional companion marker: rewrite the upstream stream instead of piping it verbatim
+    // ("openai" = Gemini SSE/JSON -> OpenAI chat.completion.chunk events).
+    "_stream_transform"
 ]);
 
 // Some upstreams (for example 豆包-backed video models) only return HEVC/H.265, which
@@ -618,6 +621,172 @@ function isStreamPassthroughPayload(payload) {
     return isObject(payload) && payload._stream_passthrough === true;
 }
 
+// `_stream_passthrough` alone pipes the upstream body through verbatim; a req_mapping can add
+// `_stream_transform` to rewrite it instead. "openai" turns a Gemini SSE stream (or a single
+// Gemini JSON document) into OpenAI chat.completion.chunk events.
+const STREAM_TRANSFORMS = new Set(["openai"]);
+
+function getStreamTransform(payload) {
+    if (!isObject(payload)) {
+        return null;
+    }
+    const value = payload._stream_transform || payload.stream_transform;
+    if (!value) {
+        return null;
+    }
+    const normalized = String(value).toLowerCase();
+    return STREAM_TRANSFORMS.has(normalized) ? normalized : null;
+}
+
+function mapFinishReason(reason) {
+    const value = String(reason || "").toUpperCase();
+    if (!value) {
+        return null;
+    }
+    if (value === "STOP") {
+        return "stop";
+    }
+    if (value === "MAX_TOKENS") {
+        return "length";
+    }
+    if (["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"].includes(value)) {
+        return "content_filter";
+    }
+    return value.toLowerCase();
+}
+
+function newCompletionId() {
+    return `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
+}
+
+// Gemini -> OpenAI streaming converter. Accepts SSE text (fragments are fine, frames are
+// reassembled) or a whole Gemini JSON payload, and returns ready-to-write SSE strings.
+// The OpenAI role chunk is emitted lazily so the upstream responseId/createTime, when present,
+// can be adopted before anything is sent.
+function createOpenAiStreamConverter(options = {}) {
+    const model = options.model || "unknown";
+    const fallbackCreated = options.created || Math.floor(Date.now() / 1000);
+    let id = options.id || newCompletionId();
+    let created = fallbackCreated;
+    let buffer = "";
+    let started = false;
+    let finished = false;
+    let usage = null;
+
+    const frame = payload => `data: ${JSON.stringify(payload)}\n\n`;
+
+    function chunk(choices, extra) {
+        return frame({ id, object: "chat.completion.chunk", created, model, choices, ...extra });
+    }
+
+    function startChunks() {
+        if (started) {
+            return [];
+        }
+        started = true;
+        return [chunk([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }])];
+    }
+
+    function usageFrom(metadata) {
+        if (!isObject(metadata)) {
+            return null;
+        }
+        const prompt = Number(metadata.promptTokenCount);
+        const completion = Number(metadata.candidatesTokenCount);
+        const total = Number(metadata.totalTokenCount);
+        if (!Number.isFinite(prompt) && !Number.isFinite(completion) && !Number.isFinite(total)) {
+            return null;
+        }
+        return {
+            prompt_tokens: Number.isFinite(prompt) ? prompt : 0,
+            completion_tokens: Number.isFinite(completion) ? completion : 0,
+            total_tokens: Number.isFinite(total) ? total : (Number.isFinite(prompt) ? prompt : 0) + (Number.isFinite(completion) ? completion : 0)
+        };
+    }
+
+    function textOfCandidate(candidate) {
+        const parts = isObject(candidate) && Array.isArray(candidate.content && candidate.content.parts) ? candidate.content.parts : [];
+        return parts
+            .filter(part => isObject(part) && typeof part.text === "string" && part.thought !== true)
+            .map(part => part.text)
+            .join("");
+    }
+
+    function pushPayload(payload) {
+        if (!isObject(payload)) {
+            return [];
+        }
+        if (typeof payload.responseId === "string" && payload.responseId && !started) {
+            id = payload.responseId;
+        }
+        if (typeof payload.createTime === "string" && payload.createTime.includes("T")) {
+            const millis = Date.parse(payload.createTime);
+            if (Number.isFinite(millis) && !started) {
+                created = Math.floor(millis / 1000);
+            }
+        }
+        const nextUsage = usageFrom(payload.usageMetadata);
+        if (nextUsage) {
+            usage = nextUsage;
+        }
+
+        const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+        if (!candidates.length) {
+            return [];
+        }
+
+        const out = startChunks();
+        candidates.forEach((candidate, index) => {
+            const text = textOfCandidate(candidate);
+            if (text) {
+                out.push(chunk([{ index, delta: { content: text }, finish_reason: null }]));
+            }
+            const finishReason = mapFinishReason(candidate && candidate.finishReason);
+            if (finishReason) {
+                finished = true;
+                out.push(chunk([{ index, delta: {}, finish_reason: finishReason }], usage ? { usage } : {}));
+            }
+        });
+        return out;
+    }
+
+    function pushSseText(text) {
+        buffer += String(text || "");
+        const out = [];
+        let separator = buffer.search(/\r?\n\r?\n/);
+        while (separator !== -1) {
+            const rawFrame = buffer.slice(0, separator);
+            buffer = buffer.slice(separator + buffer.slice(separator).match(/^\r?\n\r?\n/)[0].length);
+            const data = rawFrame
+                .split(/\r?\n/)
+                .filter(line => line.startsWith("data:"))
+                .map(line => line.slice(5).trim())
+                .join("");
+            if (data && data !== "[DONE]") {
+                try {
+                    out.push(...pushPayload(JSON.parse(data)));
+                } catch (error) {
+                    console.warn("[Gateway Stream] skipping unparsable upstream SSE frame:", error.message);
+                }
+            }
+            separator = buffer.search(/\r?\n\r?\n/);
+        }
+        return out;
+    }
+
+    function finish() {
+        const out = startChunks();
+        if (!finished) {
+            out.push(chunk([{ index: 0, delta: {}, finish_reason: "stop" }], usage ? { usage } : {}));
+            finished = true;
+        }
+        out.push("data: [DONE]\n\n");
+        return out;
+    }
+
+    return { pushPayload, pushSseText, finish };
+}
+
 async function readStreamAsText(stream) {
     const chunks = [];
     for await (const chunk of stream) {
@@ -626,9 +795,76 @@ async function readStreamAsText(stream) {
     return Buffer.concat(chunks).toString("utf8");
 }
 
+function prepareStreamResponse(res, upstreamRes, logLabel) {
+    res.setHeader("X-Accel-Buffering", "no");
+    const upstreamStream = upstreamRes.data;
+    const cleanup = () => {
+        if (!upstreamStream.destroyed) {
+            upstreamStream.destroy();
+        }
+    };
+    res.on("close", cleanup);
+    upstreamStream.on("error", error => {
+        console.error(`[${logLabel}] upstream stream error:`, error.message);
+        cleanup();
+        if (!res.writableEnded) {
+            res.end();
+        }
+    });
+    res.status(upstreamRes.status);
+    if (typeof res.flushHeaders === "function") {
+        res.flushHeaders();
+    }
+    return { upstreamStream, cleanup };
+}
+
+// Rewrites the upstream answer as an OpenAI SSE stream: role chunk, one chunk per text delta,
+// a final chunk carrying finish_reason (and usage when the upstream reported it), then [DONE].
+async function streamAsOpenAiSse(upstreamRes, res, binding, logLabel) {
+    const contentType = String(upstreamRes.headers["content-type"] || "");
+    const isSse = contentType.includes("text/event-stream");
+    console.log(`[${logLabel}] Converting upstream ${upstreamRes.status} ${contentType} to OpenAI SSE for downstream`);
+
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    const { upstreamStream } = prepareStreamResponse(res, upstreamRes, logLabel);
+    const converter = createOpenAiStreamConverter({ model: binding.model_name });
+
+    if (!isSse) {
+        // Some gateways answer with one Gemini JSON document even when alt=sse was requested.
+        const text = await readStreamAsText(upstreamStream);
+        let payload = null;
+        try {
+            payload = JSON.parse(text);
+        } catch (error) {
+            payload = null;
+        }
+        const frames = payload ? converter.pushPayload(payload) : [];
+        for (const item of [...frames, ...converter.finish()]) {
+            res.write(item);
+        }
+        return res.end();
+    }
+
+    upstreamStream.setEncoding("utf8");
+    upstreamStream.on("data", text => {
+        for (const item of converter.pushSseText(text)) {
+            res.write(item);
+        }
+    });
+    upstreamStream.on("end", () => {
+        if (!res.writableEnded) {
+            for (const item of converter.finish()) {
+                res.write(item);
+            }
+            res.end();
+        }
+    });
+}
+
 // Pipes the upstream body (SSE or otherwise) to the downstream response untouched, keeping
 // the upstream content type. Non-2xx answers are buffered so error_passthrough still works.
-async function streamMappedResponse(postRequest, upstreamUrl, res, binding, logLabel) {
+async function streamMappedResponse(postRequest, upstreamUrl, res, binding, logLabel, transform) {
     const upstreamRes = await axios.post(upstreamUrl, postRequest.data, {
         ...postRequest.options,
         responseType: "stream",
@@ -652,35 +888,18 @@ async function streamMappedResponse(postRequest, upstreamUrl, res, binding, logL
         return res.status(502).json({ error: "Upstream request failed", upstream_status: upstreamRes.status });
     }
 
+    if (transform === "openai") {
+        return streamAsOpenAiSse(upstreamRes, res, binding, logLabel);
+    }
+
     if (upstreamRes.headers["content-type"]) {
         res.setHeader("Content-Type", upstreamRes.headers["content-type"]);
     }
     if (upstreamRes.headers["cache-control"]) {
         res.setHeader("Cache-Control", upstreamRes.headers["cache-control"]);
     }
-    // Disable buffering in front proxies (nginx) so SSE chunks reach the client immediately.
-    res.setHeader("X-Accel-Buffering", "no");
-
-    const upstreamStream = upstreamRes.data;
-    const cleanup = () => {
-        if (!upstreamStream.destroyed) {
-            upstreamStream.destroy();
-        }
-    };
-    res.on("close", cleanup);
-    upstreamStream.on("error", error => {
-        console.error(`[${logLabel}] upstream stream error:`, error.message);
-        cleanup();
-        if (!res.writableEnded) {
-            res.end();
-        }
-    });
-
     console.log(`[${logLabel}] Streaming upstream ${upstreamRes.status} ${upstreamRes.headers["content-type"] || ""} to downstream`);
-    res.status(upstreamRes.status);
-    if (typeof res.flushHeaders === "function") {
-        res.flushHeaders();
-    }
+    const { upstreamStream } = prepareStreamResponse(res, upstreamRes, logLabel);
     upstreamStream.pipe(res);
 }
 
@@ -697,7 +916,7 @@ async function sendMappedPost(binding, body, logLabel, options = {}) {
     console.log(`[${logLabel}] Routing ${binding.model_name} to ${binding.channel_name}: ${upstreamUrl}`);
     const postRequest = await buildPostOptions(upstreamKey, upstreamPayload, binding.channel_auth_type);
     if (options.streamTarget && isStreamPassthroughPayload(upstreamPayload)) {
-        await streamMappedResponse(postRequest, upstreamUrl, options.streamTarget, binding, logLabel);
+        await streamMappedResponse(postRequest, upstreamUrl, options.streamTarget, binding, logLabel, getStreamTransform(upstreamPayload));
         return { streamed: true, upstreamKey, optimizerTrace: trace, gwResponse: null };
     }
     const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
@@ -1555,6 +1774,9 @@ module.exports = {
         extractImageBedUrl,
         normalizeVideoError,
         wantsStreamedResponse,
-        isStreamPassthroughPayload
+        isStreamPassthroughPayload,
+        getStreamTransform,
+        mapFinishReason,
+        createOpenAiStreamConverter
     }
 };

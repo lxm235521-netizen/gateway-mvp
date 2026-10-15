@@ -1691,26 +1691,40 @@ OpenAI 兼容异步、以及 `/v1beta/models/{model}:generateContent`）。本�
 | `n`（>1） | `generationConfig.candidateCount` | `n=1` 不下发 |
 | `stop`（字符串或数组） | `generationConfig.stopSequences` | |
 | `response_format.type = "json_object"` | `generationConfig.responseMimeType = "application/json"` | |
-| `stream: true` | 路由改走 `?alt=sse`，并置网关内部标记 `_stream_passthrough` | 见下「流式透传」 |
+| `stream: true` | 路由改走 `?alt=sse`，并置网关内部标记 `_stream_passthrough: true` + `_stream_transform: "openai"` | 见下「流式：映射级能力与 OpenAI 化」 |
 
 `tools` / `functions` / `tool_calls` **未做转换**，需要时再补。
 
-#### 流式透传：网关新增的映射级能力
+#### 流式：映射级能力与 OpenAI 化
 
 原来的 `/v1/chat/completions` 只会用 axios 缓冲上游响应、再套 `resp_mapping`（JSONata 无法表达
-SSE），所以对 SSE 上游不可用。现在加了一个**按绑定可选**的能力：
+SSE），所以对 SSE 上游不可用。现在加了一组**按绑定可选**的映射级能力：
 
-- `req_mapping` 在输出里带 `"_stream_passthrough": true`（同时把 `_route_path` 指向 SSE 地址）
-  即表示「这个绑定要透传」；该标记和 `_route_path` 一样属于网关元数据，**不会发给上游**
+- `req_mapping` 输出 `"_stream_passthrough": true`（同时把 `_route_path` 指向 SSE 地址）
+  表示「这个绑定不要缓冲，按流式处理」；下游请求带 `stream: true`（布尔或字符串 `"true"`）时生效。
+  该标记与 `_route_path`、`_stream_transform` 一样属于网关元数据，**不会发给上游**
   （已加进 `MULTIPART_META_KEYS`）。
-- 下游请求带 `stream: true`（布尔或字符串 `"true"`）且该绑定声明了透传时，网关改用
-  `responseType: "stream"` 请求上游，按上游原样把响应体 pipe 给下游，保留上游
-  `content-type`（`text/event-stream`）并加 `X-Accel-Buffering: no`；下游断开时销毁上游连接。
+- 再加 `"_stream_transform": "openai"` 时，网关不原样转发，而是把上游的 **Gemini 事件转换成
+  OpenAI 格式的 SSE**：
+  - 先发一个 `choices[0].delta = {"role":"assistant","content":""}` 的角色 chunk；
+  - 每个 Gemini 事件里的 `candidates[].content.parts[].text`（跳过 `thought` 段）累加成
+    `choices[].delta.content` 增量 chunk（多个 candidate 按数组下标映射成 `choices[].index`）；
+  - `finishReason` 映射成 OpenAI 的 `finish_reason`：`STOP`→`stop`、`MAX_TOKENS`→`length`、
+    `SAFETY` / `RECITATION` / `BLOCKLIST` / `PROHIBITED_CONTENT` / `SPII` / `IMAGE_SAFETY`→`content_filter`，
+    其他小写原样；收尾时若上游一直没给终态，也补一个 `stop` 终态；
+  - `usage`（取自 `usageMetadata`）挂在最后一个 chunk 上，最后补 `data: [DONE]\n\n`；
+  - `id` / `created` 优先采用上游的 `responseId` / `createTime`（ISO 转 Unix 秒），
+    没有则网关生成 `chatcmpl-<hex>` 与当前秒；
+  - 逐帧解析（HTTP 分片会拼接后再解析），坏帧只记日志跳过，不影响整条流；
+  - 上游即使带 `alt=sse` 却只回一个 Gemini JSON 文档，也会被当成单事件转换并正常收尾。
+- **不**加 `_stream_transform`（只有 `_stream_passthrough: true`）时保持**逐字节透传**：
+  保留上游 `content-type`（`text/event-stream`）直接 pipe，适合下游本来就按 Gemini 事件解析的场景。
+- 转成 OpenAI 格式时响应头重写为 `Content-Type: text/event-stream; charset=utf-8` +
+  `Cache-Control: no-cache, no-transform`，并保留 `X-Accel-Buffering: no`（前端代理不缓冲）。
 - 其他绑定、以及没声明透传的绑定，行为与以前完全一致（缓冲 + `resp_mapping`）。
 - 上游非 2xx 时先缓冲错误体，再按 `error_passthrough` 原样返回状态码与错误体
-  （new-api 的形状是 `{"error":{"message":...,"type":"new_api_error","code":...}}`）。
-- 透传是**逐字节**的：下游收到的是 Gemini 的 `data: {"candidates":[...]}` 事件，
-  **不做 OpenAI delta 转换**。要 OpenAI 风格流式（`choices[0].delta`）需要再加一层转换。
+  （new-api 的形状是 `{"error":{"message":...,"type":"new_api_error","code":...}}`）；
+  下游断开时销毁上游连接。
 - 非流式（下游不传 `stream`）走 `:generateContent`，由 `resp_mapping` 把 Gemini JSON 归一成
   OpenAI 风格 `chat.completion`（`choices[0].message.content` 由 `candidates[0].content.parts[].text`
   拼接，`finishReason` 小写进 `finish_reason`，`usageMetadata` 进 `usage`）。
@@ -1722,23 +1736,44 @@ SSE），所以对 SSE 上游不可用。现在加了一个**按绑定可选**�
 渠道按 `name` / `base_url` 复用、逻辑模型按 `model_name` 复用、绑定按（逻辑模型，渠道）复用，
 重复执行只更新差异字段、不覆盖已有密钥）。
 
-- `node --test test/ai666-gemini.test.js`（10 项）：请求转换（contents / systemInstruction /
-  generationConfig / 多模态 part）、流式与非流式的路由与标记、响应归一、以及网关
-  `wantsStreamedResponse` / `isStreamPassthroughPayload` 两个纯函数。
-- `node tools/verify-ai666-gemini.js [网关地址] [网关密钥] [mock 端口]`（15 项，全部通过）：
+- `node --test test/ai666-gemini.test.js`（11 项）：请求转换（contents / systemInstruction /
+  generationConfig / 多模态 part）、流式与非流式的路由与标记、响应归一、
+  `wantsStreamedResponse` / `isStreamPassthroughPayload` / `getStreamTransform` 三个纯函数，
+  以及 Gemini→OpenAI 转换器（角色 chunk、增量、分片拼帧、终态、usage、坏帧 / 空事件、
+  非 SSE 单 JSON 兜底、`finishReason` 映射）。
+- `node tools/verify-ai666-gemini.js [网关地址] [网关密钥] [mock 端口]`（25 项，全部通过）：
   在宿主机起 mock Gemini 上游（端口 4621，容器经 `host.docker.internal` 访问），
-  临时建渠道 + 逻辑模型 + 绑定（**映射逐字取自生产绑定**），走完整网关链路后无条件删除临时记录。
-  实测断言：流式请求上游收到 `/v1beta/models/gemini-4-argon:generateContent?alt=sse`、
-  `Authorization: Bearer <渠道密钥>`、纯 Gemini 报文（`_route_path` / `_stream_passthrough`
-  等网关字段没有泄漏）、SSE 逐字节透传；非流式收到不带 `alt=sse` 的路径且响应归一成
-  `chat.completion`；上游 429 时状态码与 `new_api_error` 错误体原样透传。
+  临时建两个绑定（**映射逐字取自生产绑定**，其中一个去掉 `_stream_transform`），
+  走完整网关链路后无条件删除临时记录。实测断言：上游收到
+  `/v1beta/models/gemini-4-argon:generateContent?alt=sse`、`Authorization: Bearer <渠道密钥>`、
+  纯 Gemini 报文（`_route_path` / `_stream_passthrough` / `_stream_transform` 等网关字段没有泄漏）；
+  流式返回是 OpenAI 格式（首个 chunk 为 assistant 角色、delta 拼起来等于完整回答、
+  最后一个 chunk 带 `finish_reason: stop` 与 `usage`、以 `data: [DONE]` 收尾、返回体里没有
+  `candidates` 原始字段、`id`/`created` 采用上游 `responseId`/`createTime`）；
+  只带 `_stream_passthrough` 的绑定仍是逐字节透传；上游只回一个 JSON 文档时也能转成 OpenAI SSE；
+  非流式收到不带 `alt=sse` 的路径且响应归一成 `chat.completion`；
+  上游 429 时状态码与 `new_api_error` 错误体原样透传。
 - 2026-10 真实调用（各一次、`max_tokens` 很小）：非流式经网关返回
   `{"object":"chat.completion","model":"gemini-4-argon","choices":[{"message":{"content":"OK"}}],"usage":{...}}`；
-  流式经网关返回 `Content-Type: text/event-stream` + `Transfer-Encoding: chunked`，
-  内容是上游 Gemini 的 `data: {"candidates":...}` 事件，确认透传链路可用。
-- 本次为支持 SSE 透传改了 `server.js`（新增 `_stream_passthrough` 透传分支与
-  `res.headersSent` 兜底），因此**需要重新构建并重启网关容器**才生效：
-  `docker compose up -d --build gateway`。
+  流式经网关返回 `Content-Type: text/event-stream; charset=utf-8` + `Transfer-Encoding: chunked`，
+  内容已经是 OpenAI 格式：
+
+  ```
+  data: {"id":"rlrQarb_LcjKmPUPpaKJuQs","object":"chat.completion.chunk","created":1792039598,"model":"gemini-4-argon","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+  data: {"id":"rlrQarb_LcjKmPUPpaKJuQs",...,"choices":[{"index":0,"delta":{"content":"1 2 "},"finish_reason":null}]}
+
+  data: {"id":"rlrQarb_LcjKmPUPpaKJuQs",...,"choices":[{"index":0,"delta":{"content":"3"},"finish_reason":null}]}
+
+  data: {"id":"rlrQarb_LcjKmPUPpaKJuQs",...,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":38,"completion_tokens":9,"total_tokens":47}}
+
+  data: [DONE]
+  ```
+
+- 本次为支持流式改动改了 `server.js`（`_stream_passthrough` 流式分支、`_stream_transform`
+  Gemini→OpenAI 转换器、`res.headersSent` 兜底），因此**需要重新构建并重启网关容器**才生效：
+  `docker compose up -d --build gateway`；映射改动还要执行一次
+  `node scripts/add-ai666-gemini.js --apply`（映射存在数据库里）。
 
 写映射时又踩到的 JSONata 2.2.2 坑：`$map` / `$filter` 的结果是**序列**，只有单个元素时会折成
 标量，导致 `contents` / `parts` 变成对象而不是数组（Gemini 要求数组）。修法是显式用数组构造器

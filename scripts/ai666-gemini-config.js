@@ -22,14 +22,20 @@
 //   n (>1)                        -> generationConfig.candidateCount
 //   stop（字符串或数组）           -> generationConfig.stopSequences
 //   response_format.type=json_object -> generationConfig.responseMimeType = "application/json"
-//   stream=true                   -> 上游改用 ?alt=sse，并置网关内部标记 _stream_passthrough
-//                                    让网关把上游响应**原样透传**给下游（不做响应映射）
+//   stream=true                   -> 上游改用 ?alt=sse，并置网关内部标记
+//                                    `_stream_passthrough: true` + `_stream_transform: "openai"`：
+//                                    网关把上游的 Gemini 事件**转换成 OpenAI 风格的 SSE**
+//                                    （chat.completion.chunk + choices[].delta + [DONE]）
 //   stream 缺省/false             -> 走上游 :generateContent（无 alt=sse），
 //                                    响应由 resp_mapping 转成 OpenAI 风格 chat.completion JSON
 //
 // 注意：
-//   - 流式分支是**逐字节透传**上游 SSE（Gemini 的 `data: {"candidates":[...]}` 事件格式），
-//     不做 OpenAI delta 转换；下游要按 Gemini SSE 解析。需要 OpenAI 风格 delta 的话要再加一层转换。
+//   - 流式分支输出的是 OpenAI 格式（`data: {"object":"chat.completion.chunk",...}` + `data: [DONE]`），
+//     下游可以按标准 OpenAI 流式客户端解析；只想要上游原始 Gemini SSE 时，
+//     把 `_stream_transform` 去掉（仅保留 `_stream_passthrough: true`）即可恢复逐字节透传。
+//   - 转换规则：Gemini `candidates[].content.parts[].text` 累加成 delta.content；
+//     `finishReason` STOP/MAX_TOKENS/SAFETY... 映射成 stop/length/content_filter；
+//     最后一个 chunk 带 usage（取自 usageMetadata）；id/created 取上游 responseId/createTime。
 //   - 上游报错（400/401/402/429…）时网关先缓冲错误体，再按 error_passthrough=1 原样回给下游
 //     （形状是 new-api 的 {"error":{"message":...,"type":"new_api_error","code":...}}）。
 //   - tools / functions / tool_calls 未做转换，需要时再补。
@@ -60,8 +66,8 @@ const models = [
             + 'system/developer 转成 systemInstruction，temperature/top_p/max_tokens/n/stop/'
             + 'response_format(json_object) 转成 generationConfig 对应字段（topP 缺省 0.95）。'
             + '参考图：data URL 转 inlineData，http(s) URL 转 fileData.fileUri。'
-            + 'stream=true 时上游走 alt=sse，网关把上游 SSE **原样透传**给下游'
-            + '（Gemini data: {"candidates":[...]} 事件，不做 OpenAI delta 转换）；'
+            + 'stream=true 时上游走 alt=sse，网关把 Gemini 事件转换成 **OpenAI 风格 SSE**'
+            + '（chat.completion.chunk + choices[].delta + data: [DONE]，含 usage，可被标准 OpenAI 流式客户端解析）；'
             + '不传 stream 时走非流式，响应映射成 OpenAI 风格 chat.completion JSON（含 usage）。'
             + '上游错误按 error_passthrough 原样返回（new-api 的 {"error":{...}}）。'
     }
@@ -102,7 +108,7 @@ const req_mapping = `(
     $systemText != "" ? { "systemInstruction": { "parts": [{ "text": $systemText }] } } : {},
     { "generationConfig": $generationConfig },
     { "_route_path": $wantsStream ? "${ROUTE_STREAM}" : "${ROUTE_PLAIN}" },
-    $wantsStream ? { "_stream_passthrough": true } : {}
+    $wantsStream ? { "_stream_passthrough": true, "_stream_transform": "openai" } : {}
   ])
 )`;
 

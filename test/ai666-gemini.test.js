@@ -50,7 +50,8 @@ test('用户给的流式请求：content 为数组、走 alt=sse 且标记透传
         contents: [{ role: 'user', parts: [{ text: '你好' }] }],
         generationConfig: { maxOutputTokens: 65536, temperature: 0.7, topP: 0.95 },
         _route_path: cfg.ROUTE_STREAM,
-        _stream_passthrough: true
+        _stream_passthrough: true,
+        _stream_transform: 'openai'
     });
     // 网关内部标记与路由不能出现在真正发给上游的 body 里（由 server.js 的 meta key 过滤）。
     assert.equal('model' in mapped, false);
@@ -171,7 +172,7 @@ test('非流式响应归一成 OpenAI 风格 chat.completion', async () => {
 });
 
 test('网关的流式透传开关只认映射里的 _stream_passthrough 标记', () => {
-    const { wantsStreamedResponse, isStreamPassthroughPayload } = require('../server').__internal;
+    const { wantsStreamedResponse, isStreamPassthroughPayload, getStreamTransform } = require('../server').__internal;
 
     assert.equal(wantsStreamedResponse({ stream: true }), true);
     assert.equal(wantsStreamedResponse({ stream: 'true' }), true);
@@ -186,11 +187,75 @@ test('网关的流式透传开关只认映射里的 _stream_passthrough 标记',
     assert.equal(isStreamPassthroughPayload({ contents: [] }), false);
     assert.equal(isStreamPassthroughPayload(null), false);
 
+    // 没有 _stream_transform 时仍是逐字节透传；只有 openai 是已知的转换。
+    assert.equal(getStreamTransform({ _stream_passthrough: true }), null);
+    assert.equal(getStreamTransform({ _stream_transform: 'openai' }), 'openai');
+    assert.equal(getStreamTransform({ _stream_transform: 'OPENAI' }), 'openai');
+    assert.equal(getStreamTransform({ _stream_transform: 'something-else' }), null);
+    assert.equal(getStreamTransform(null), null);
+
     // 生产映射的流式请求体一定带标记，非流式一定不带。
     return (async () => {
         const streaming = await evaluate(cfg.req_mapping, { messages: [{ role: 'user', content: 'x' }], stream: true });
         const plain = await evaluate(cfg.req_mapping, { messages: [{ role: 'user', content: 'x' }] });
         assert.equal(isStreamPassthroughPayload(streaming), true);
+        assert.equal(getStreamTransform(streaming), 'openai');
         assert.equal(isStreamPassthroughPayload(plain), false);
     })();
+});
+
+test('Gemini 流式事件被转成 OpenAI 的 chat.completion.chunk + [DONE]', () => {
+    const { createOpenAiStreamConverter, mapFinishReason } = require('../server').__internal;
+    const parse = frames => frames.map(frame => (frame === 'data: [DONE]\n\n' ? '[DONE]' : JSON.parse(frame.replace(/^data: /, ''))));
+
+    const converter = createOpenAiStreamConverter({ model: 'gemini-4-argon' });
+    // 第一帧：带 responseId / createTime，网关要采用它们作为 id / created。
+    const first = parse(converter.pushSseText('data: {"candidates":[{"content":{"role":"model","parts":[{"text":"1 2 "}]}}],"responseId":"up-1","createTime":"2026-10-15T04:20:17.825Z"}\n\n'));
+    assert.equal(first.length, 2);
+    assert.equal(first[0].object, 'chat.completion.chunk');
+    assert.equal(first[0].model, 'gemini-4-argon');
+    assert.equal(first[0].id, 'up-1');
+    assert.equal(first[0].created, 1792038017);
+    assert.deepEqual(first[0].choices, [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }]);
+    assert.deepEqual(first[1].choices, [{ index: 0, delta: { content: '1 2 ' }, finish_reason: null }]);
+
+    // 事件被拆成两次到达（HTTP 分片），要能正确拼帧。
+    const partial = converter.pushSseText('data: {"candidates":[{"content":{"parts":[{"text":"3"}]}}]}\n');
+    assert.deepEqual(partial, []);
+    const rest = parse(converter.pushSseText('\ndata: {"candidates":[{"content":{"parts":[{"text":"abc"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":38,"candidatesTokenCount":9,"totalTokenCount":47}}\n\n'));
+    assert.deepEqual(rest[0].choices, [{ index: 0, delta: { content: '3' }, finish_reason: null }]);
+    assert.deepEqual(rest[1].choices, [{ index: 0, delta: { content: 'abc' }, finish_reason: null }]);
+    assert.deepEqual(rest[2].choices, [{ index: 0, delta: {}, finish_reason: 'stop' }]);
+    assert.deepEqual(rest[2].usage, { prompt_tokens: 38, completion_tokens: 9, total_tokens: 47 });
+
+    // 已经是终态后，finish() 只补 [DONE]。
+    assert.deepEqual(converter.finish(), ['data: [DONE]\n\n']);
+
+    // 上游没给 finishReason 时，finish() 兜一个 stop 终态再收尾。
+    const noFinish = createOpenAiStreamConverter({ model: 'm' });
+    noFinish.pushSseText('data: {"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}\n\n');
+    const tail = parse(noFinish.finish());
+    assert.equal(tail[tail.length - 2].choices[0].finish_reason, 'stop');
+    assert.equal(tail[tail.length - 1], '[DONE]');
+
+    // 非 SSE（上游只回一个 Gemini JSON 文档）也要能转。
+    const jsonDoc = createOpenAiStreamConverter({ model: 'm' });
+    const fromJson = parse(jsonDoc.pushPayload({
+        candidates: [{ content: { parts: [{ text: 'A' }, { text: 'B', thought: true }] }, finishReason: 'MAX_TOKENS' }]
+    }));
+    assert.deepEqual(fromJson[1].choices, [{ index: 0, delta: { content: 'A' }, finish_reason: null }]);
+    assert.deepEqual(fromJson[2].choices, [{ index: 0, delta: {}, finish_reason: 'length' }]);
+
+    // 空事件 / 坏 JSON / 只有 usageMetadata 的事件都不能炸，也不能产出 chunk。
+    const quiet = createOpenAiStreamConverter({ model: 'm' });
+    assert.deepEqual(quiet.pushSseText('data: {"usageMetadata":{"totalTokenCount":1}}\n\n'), []);
+    assert.deepEqual(quiet.pushSseText('data: {not json}\n\n'), []);
+    assert.deepEqual(quiet.pushSseText('data: [DONE]\n\n'), []);
+
+    assert.equal(mapFinishReason('STOP'), 'stop');
+    assert.equal(mapFinishReason('MAX_TOKENS'), 'length');
+    assert.equal(mapFinishReason('SAFETY'), 'content_filter');
+    assert.equal(mapFinishReason('PROHIBITED_CONTENT'), 'content_filter');
+    assert.equal(mapFinishReason('OTHER'), 'other');
+    assert.equal(mapFinishReason(undefined), null);
 });
