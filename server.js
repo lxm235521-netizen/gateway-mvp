@@ -27,7 +27,12 @@ const MULTIPART_META_KEYS = new Set([
     "files",
     "fields",
     "_file_fields",
-    "file_fields"
+    "file_fields",
+    // Opt-in marker: a req_mapping that targets an SSE upstream (for example Gemini's
+    // /v1beta/models/{model}:generateContent?alt=sse) sets this so the gateway pipes the
+    // upstream body through verbatim instead of buffering it and re-mapping the response.
+    // It is gateway metadata and must never be forwarded upstream.
+    "_stream_passthrough"
 ]);
 
 // Some upstreams (for example 豆包-backed video models) only return HEVC/H.265, which
@@ -598,6 +603,87 @@ async function loadGlobalOptimizerDefaults() {
     }
 }
 
+// Downstream OpenAI-compatible callers ask for `stream: true`. The gateway normally buffers
+// the upstream response and re-maps it with resp_mapping (which cannot express SSE), so a
+// binding whose req_mapping opts in with `"_stream_passthrough": true` gets its upstream body
+// piped through verbatim instead. Every other binding keeps the old buffered behaviour.
+function wantsStreamedResponse(body) {
+    if (!isObject(body)) {
+        return false;
+    }
+    return body.stream === true || String(body.stream).toLowerCase() === "true";
+}
+
+function isStreamPassthroughPayload(payload) {
+    return isObject(payload) && payload._stream_passthrough === true;
+}
+
+async function readStreamAsText(stream) {
+    const chunks = [];
+    for await (const chunk of stream) {
+        chunks.push(chunk);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+}
+
+// Pipes the upstream body (SSE or otherwise) to the downstream response untouched, keeping
+// the upstream content type. Non-2xx answers are buffered so error_passthrough still works.
+async function streamMappedResponse(postRequest, upstreamUrl, res, binding, logLabel) {
+    const upstreamRes = await axios.post(upstreamUrl, postRequest.data, {
+        ...postRequest.options,
+        responseType: "stream",
+        validateStatus: () => true,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        timeout: 0
+    });
+
+    if (upstreamRes.status < 200 || upstreamRes.status >= 300) {
+        const text = await readStreamAsText(upstreamRes.data);
+        let payload = text;
+        try {
+            payload = JSON.parse(text);
+        } catch (error) {
+            // Keep the raw body when the upstream error is not JSON.
+        }
+        if (binding.error_passthrough) {
+            return res.status(upstreamRes.status).json(payload);
+        }
+        return res.status(502).json({ error: "Upstream request failed", upstream_status: upstreamRes.status });
+    }
+
+    if (upstreamRes.headers["content-type"]) {
+        res.setHeader("Content-Type", upstreamRes.headers["content-type"]);
+    }
+    if (upstreamRes.headers["cache-control"]) {
+        res.setHeader("Cache-Control", upstreamRes.headers["cache-control"]);
+    }
+    // Disable buffering in front proxies (nginx) so SSE chunks reach the client immediately.
+    res.setHeader("X-Accel-Buffering", "no");
+
+    const upstreamStream = upstreamRes.data;
+    const cleanup = () => {
+        if (!upstreamStream.destroyed) {
+            upstreamStream.destroy();
+        }
+    };
+    res.on("close", cleanup);
+    upstreamStream.on("error", error => {
+        console.error(`[${logLabel}] upstream stream error:`, error.message);
+        cleanup();
+        if (!res.writableEnded) {
+            res.end();
+        }
+    });
+
+    console.log(`[${logLabel}] Streaming upstream ${upstreamRes.status} ${upstreamRes.headers["content-type"] || ""} to downstream`);
+    res.status(upstreamRes.status);
+    if (typeof res.flushHeaders === "function") {
+        res.flushHeaders();
+    }
+    upstreamStream.pipe(res);
+}
+
 async function sendMappedPost(binding, body, logLabel, options = {}) {
     // Prompt optimization runs on the caller's original body so the optimizer
     // receives inline image data, before any channel-level base64 -> URL upload.
@@ -610,13 +696,17 @@ async function sendMappedPost(binding, body, logLabel, options = {}) {
 
     console.log(`[${logLabel}] Routing ${binding.model_name} to ${binding.channel_name}: ${upstreamUrl}`);
     const postRequest = await buildPostOptions(upstreamKey, upstreamPayload, binding.channel_auth_type);
+    if (options.streamTarget && isStreamPassthroughPayload(upstreamPayload)) {
+        await streamMappedResponse(postRequest, upstreamUrl, options.streamTarget, binding, logLabel);
+        return { streamed: true, upstreamKey, optimizerTrace: trace, gwResponse: null };
+    }
     const upstreamRes = await axios.post(upstreamUrl, postRequest.data, postRequest.options);
     const mappedResponse = await executeMapping(binding.resp_mapping, upstreamRes.data);
     // Channels that opt in get inline base64 answers rewritten to image-bed http links,
     // so downstream always receives the same shape regardless of the upstream format.
     const gwResponse = await tryConvertResponseImages(mappedResponse, binding);
 
-    return { gwResponse, upstreamKey, optimizerTrace: trace };
+    return { gwResponse, upstreamKey, optimizerTrace: trace, streamed: false };
 }
 
 // The optimizer trace is only reported to callers when the model enables debug,
@@ -1200,11 +1290,22 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
         if (req.gatewayKey) {
             await db.run('UPDATE gateway_keys SET used_quota = used_quota + 1 WHERE id = ?', [req.gatewayKey.id]);
         }
-        const { gwResponse, optimizerTrace } = await sendMappedPost(binding, req.body, "Gateway POST completions", {
-            upstreamKey: req.passThroughKey
+        const result = await sendMappedPost(binding, req.body, "Gateway POST completions", {
+            upstreamKey: req.passThroughKey,
+            // Only relevant for bindings whose req_mapping opts into stream passthrough.
+            streamTarget: wantsStreamedResponse(req.body) ? res : null
         });
-        return res.json(attachOptimizerDebug(gwResponse, binding, optimizerTrace));
+        if (result.streamed) {
+            return;
+        }
+        return res.json(attachOptimizerDebug(result.gwResponse, binding, result.optimizerTrace));
     } catch (error) {
+        // A streamed response may already have its headers (and bytes) on the wire; in that
+        // case the only sensible thing left is to end the response.
+        if (res.headersSent) {
+            console.error("[Gateway POST completions Stream Error]", error.message);
+            return res.end();
+        }
         if (tryPassthroughUpstreamError(res, error, binding && binding.error_passthrough)) return;
         console.error("[Gateway POST completions Error]", error.response ? error.response.data : error.message);
         return res.status(500).json({ error: "Upstream request failed", details: error.message });
@@ -1443,8 +1544,8 @@ if (require.main === module) start().catch(error => {
 module.exports = {
     app,
     start,
-    // Exposed for tests: pure helpers for the on-demand H.264 rendition support and for
-    // parsing image-bed upload responses.
+    // Exposed for tests: pure helpers for the on-demand H.264 rendition support, for
+    // parsing image-bed upload responses, and for the opt-in SSE passthrough path.
     __internal: {
         wantsH264,
         h264CachePaths,
@@ -1452,6 +1553,8 @@ module.exports = {
         isTranscodeError,
         H264_FORMATS,
         extractImageBedUrl,
-        normalizeVideoError
+        normalizeVideoError,
+        wantsStreamedResponse,
+        isStreamPassthroughPayload
     }
 };

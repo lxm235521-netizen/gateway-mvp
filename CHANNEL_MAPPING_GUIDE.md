@@ -661,6 +661,10 @@ Fast 模板必须提供图片且不支持音频，所有模板都不映射视频
 - 默认变体是 Sunburst；需要 Flare 时下游额外传 `variant: "flare"`，
   或直接把完整上游模型名放进 `model`（例如 `gpt-image-2.5-flare-2k-16x9`），网关会按原名透传。
 - 未接入 `1k` 档（上游 1K 名仍然存在，按需再加一条逻辑模型即可，映射生成函数按档位参数化）。
+- 本节是 **GPT Image 2.5** 产品线（`gpt-image-2.5-sunburst-…` / `gpt-image-2.5-flare-…`）。
+  同一个 `MCNIO GPT Image` 渠道上还有一条命名不同的独立产品线 **GPT Image2**
+  （`gpt-image2-1k-16x9` 这种形态：没有点号、没有 sunburst/flare 变体，档位 1k / 2k / 4k），
+  它的 1K 档见 11.9 节，两边的映射不能互相套用。
 - 白名单外的比例会归一成 `:`/`/` 换成 `x` 的形式交给上游判断，不做二次校验。
 
 图生图直接把 `images` 展开进消息：文字提示词作为 `messages[0].content` 的第一个 `text` 段，
@@ -808,6 +812,112 @@ HTTPS 渠道依赖容器内的 CA 证书库。本仓库 `Dockerfile` 使用
 此时网关上任何 `https://` 渠道都会失败，而 `http://` 渠道正常。
 自建镜像请在 `Dockerfile` 里补上：
 `RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*`。
+
+#### 第四渠道 gpt-image-duolapi（#40）：文生图改走 `/v1/images/generations`
+
+逻辑模型 `gpt-image-2` 上还有一条独立渠道绑定：渠道 `gpt-image-duolapi`
+（`https://api2.duolapi.cn`，Bearer，new-api 系网关——响应头带
+`X-New-Api-Version` / `X-Oneapi-Request-Id`），绑定位于渠道 #40，上游模型名固定
+`gpt-image-fast`。当前它是 `gpt-image-2` 唯一启用的绑定（其它渠道的绑定都是停用状态），
+所以 `gpt-image-2` 的流量全部走它。
+
+两个入口按「有没有参考图」在 `req_mapping` 里用 `_route_path` 切换：
+
+| 场景 | 上游路径 | 报文 |
+|---|---|---|
+| 文生图（无参考图） | `POST /v1/images/generations` | JSON：`model` / `prompt` / `size` / `quality` / `n` / `response_format`（**字符串** `url` 或 `b64_json`） |
+| 图生图（有参考图） | `POST /v1/images/edits` | multipart/form-data：字段同上（`response_format` 也是字符串），参考图为可重复的 `image` 文件部分 |
+
+变更历史：文生图分支**原来走 `POST /v1/chat/completions` + `messages`**（`response_format`
+是 `{"type":"url"}` 对象），2026-10 按需求改为 OpenAI 标准图片接口
+`/v1/images/generations` + `prompt`；图生图分支保持不变。旧版本已登记在配置文件的
+`legacy_req_mappings` / `legacy_resp_mappings` 里，便于识别历史绑定。
+
+其它规则与 Klong / 688 一致：`size` 画幅换算（`16:9`→`1792x1024`、`9:16`→`1024x1792`、
+`1:1`→`1024x1024`、`4:3`→`1536x1152`、`3:4`→`1152x1536`，其它值原样透传、缺省
+`1024x1024`），`quality` 缺省 `high`，`n` 缺省 `1`，提示词优先级 `prompt` >
+`messages[0].content`（字符串）> `content` 里 `type=text` 的段 > `text`；
+图生图的文件部分由网关按 `files[].source` 下载后上传（`https` 直链会被网关重新取回再作为
+文件上传，`data:image/...` 先经渠道开关 `convert_base64_to_url=1` 换成图床链接），
+`filename` 固定 `image-1` / `image-2`…，part 的 content-type 取下载时的真实类型。
+
+响应侧：优先取 `data[0].url`；上游只回 `data[0].b64_json` 时映射成 data URL，再由渠道开关
+`convert_resp_base64_to_url=1` 换成图床 HTTPS 链接返回下游（上游本来就给链接时不做改动）；
+仍兼容 chat 分支的 Markdown 图片 `![alt](url)`；空响应 / 错误体不会凭空造链接。
+
+模板与映射位于 `scripts/duolapi-gpt-image-2-config.js`，写入脚本为
+`scripts/update-duolapi-gpt-image-2.js`（`--dry-run` 预览 / `--apply` 写入；
+默认只更新「当前映射是本渠道登记过的版本」的绑定，手改过的映射需要显式 `--force`；
+渠道按 `name` / `base_url`、绑定按（逻辑模型，渠道）唯一定位，重复执行只更新差异字段，
+不动 status / weight / 密钥）。映射可用 `node --test test/duolapi-gpt-image-2.test.js`
+校验（8 项：两个分支的路由与报文形状、画幅换算与缺省值、messages 形态取词、
+参考图来源与文件命名、响应归一），不需要发起付费生成请求。
+
+注意：本绑定的映射与 Klong / 688 **不是同一份**（上游模型名不同），
+`scripts/sync-gpt-image-2-mapping.js` 默认按「逐字同源」判定，不会覆盖本绑定；
+只有显式加 `--all-bindings` 才会被覆盖，改动本渠道映射后需要重新执行本渠道的写入脚本。
+
+本次改动**没有做真实出图验证**：改完后用渠道密钥探测上游时返回
+`{"error":{"message":"Concurrency limit exceeded for user...","code":"gateway_concurrency_limit"}}`
+（该 key 当时有并发任务），因此报文形状来自映射求值与上游文档，未实际出图。
+
+#### 第五渠道 gpt-image-ad（#41，stars739.top）
+
+新增渠道 `gpt-image-ad`（`https://stars739.top`，Bearer），作为逻辑模型 `gpt-image-2`
+的另一条绑定（渠道 #41，绑定 #273，同步图片流程：`is_async=0`、`proxy_content=0`、
+`error_passthrough=1`）。上游模型名与逻辑模型名同名，`req_mapping` 里固定写死 `gpt-image-2`。
+该 Key 的 `GET /v1/models`（已实查，只读不计费）返回
+`gpt-image-2` / `gpt-image-2.5` / `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst`，
+本次只接 `gpt-image-2`，其余三个需要时按同样方式再加逻辑模型。
+
+两个入口由 `req_mapping` 按「有没有参考图」用 `_route_path` 切换：
+
+| 场景 | 上游路径 | 报文 |
+|---|---|---|
+| 文生图（无参考图） | `POST /v1/images/generations` | JSON：`model` / `prompt` / `size` / `quality` / `n` / `response_format`（字符串） |
+| 图生图（有参考图） | `POST /v1/images/edits` | multipart/form-data：字段同上，参考图为可重复的 `image` 文件 |
+
+字段规则与 11.4 其它 gpt-image-2 渠道一致（`size` 画幅换算 `16:9`→`1792x1024`、
+`9:16`→`1024x1792`、`1:1`→`1024x1024`、`4:3`→`1536x1152`、`3:4`→`1152x1536`，其它值
+原样透传、缺省 `1024x1024`；`quality` 缺省 `high`；`n` 缺省 `1`；`response_format`
+对象/空值都归一成字符串、缺省 `url`；下游「统一模板」与「OpenAI messages」两种形态都支持，
+参考图可来自顶层 `images` 或 `content` 里的 `image_url` 段）。
+
+上游返回（两个入口相同）：
+
+```json
+{
+  "created": 1792032517,
+  "background": "opaque",
+  "data": [{ "generation_id": "...", "model": "gpt-image-2", "size": "1774x887", "url": "data:image/png;base64,..." }],
+  "output_format": "png",
+  "quality": "medium",
+  "size": "1774x887",
+  "usage": { "input_tokens": 430, "output_tokens": 458, "total_tokens": 888 }
+}
+```
+
+成图是 **base64 data URL**（放在 `data[0].url`，不是 http 链接），所以渠道开关
+`convert_resp_base64_to_url = 1`：网关在响应映射之后把它上传图床、换成 HTTPS 链接再返回下游
+（下游拿到的顶层 `url` 始终是 http 链接）。请求侧 `convert_base64_to_url = 0`：
+multipart 分支的 data URL 参考图由网关自己的 multipart 构造直接解码上传，不必先过图床。
+`resp_mapping` 同时兼容只回 `data[0].b64_json` 的形态与 chat 分支的 Markdown 图片，
+空响应 / 错误体不会凭空造链接。
+
+路由提醒：`gpt-image-2` 现在有**两条启用中的绑定**——duolapi（#271）与 gpt-image-ad（#273），
+权重都是 1，多绑定按 `weight` **随机**路由（约 50/50）。要让 `gpt-image-2` 固定走某一条，
+把另一条绑定停用，或把两条的 `weight` 调成悬殊值即可。
+
+模板与映射位于 `scripts/gpt-image-ad-config.js`，写入脚本为 `scripts/add-gpt-image-ad.js`
+（`--dry-run` 预览 / `--apply` 写入，要求显式设置 `EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME`；
+渠道按 `name` / `base_url` 复用、逻辑模型按 `model_name` 复用且**不覆盖已有 remark**
+（`gpt-image-2` 是多渠道共用模型）、绑定按（逻辑模型，渠道）复用，重复执行只更新差异字段，
+不覆盖已有渠道密钥、不删除任何记录）。映射可用 `node --test test/gpt-image-ad.test.js`
+校验（8 项：两个分支的路由与报文形状、画幅换算与缺省值、messages 形态取词、
+参考图来源与文件命名、响应 data URL 归一），不需要发起付费生成请求。
+
+本次接入**没有发送真实出图请求**：上游报文按用户提供的 curl 与返回样本落地，
+连通性与模型名来自 `GET /v1/models`（200）。
 
 ### 11.5 snumom 万相 3.0 图生高速（wan3.0-image-prime）
 
@@ -1172,3 +1282,467 @@ data URL 或整段裸 base64 时才把它填进 `url`，否则 `url` 为空字�
    成功则正常返回视频并打 `[Gateway Video Proxy Fallback]` 日志。
 修复后实测用户报的那条任务（`8451e57e-...`，用的是提交时保存的旧快照映射）取流恢复正常：
 `GET /v1/videos/{id}/content` 返回 `200 video/mp4`、2031291 字节、含 `ftyp` box。
+
+### 11.9 MCNIO GPT Image2（gpt-image-2-1k）
+
+上游复用已存在的渠道 `MCNIO GPT Image`（`https://api.mcnio.com`，Bearer），
+统一入口 `POST /v1/chat/completions`，同步返回，不轮询（`is_async = 0`、`proxy_content = 0`）。
+
+**命名与 11.3 的 GPT Image 2.5 是两条不同产品线**，别互相套用：
+
+| 产品线 | 上游模型名形态 | 本网关逻辑模型 |
+|---|---|---|
+| GPT Image2 | `gpt-image2-1k-16x9`（档位 1k/2k/4k；没有点号，没有 sunburst/flare） | `gpt-image-2-1k`（本节） |
+| GPT Image 2.5 | `gpt-image-2.5-sunburst-2k-16x9`（档位 1k/2k/4k；带 sunburst / flare 变体） | `gpt-image-2.5-2k` / `gpt-image-2.5-4k`（11.3） |
+
+分辨率和比例都写在上游模型名里，比例支持
+`1x1` / `16x9` / `9x16` / `21x9` / `4x3` / `3x2` / `3x4` / `2x3` / `5x4` / `4x5`。
+上游文档明确「文生图只需要提供文字提示词，不需要再额外传 `size` / `resolution` / `aspect_ratio`」，
+因此映射只输出 `model` + `messages`，`quality` / `n` / `response_format` / `duration` /
+`width` / `height` 都不下发（2.5 产品线实测传 `quality` 会 400，这条线同样不传，走上游默认质量）。
+
+本网关只按分辨率分档暴露逻辑模型，比例由下游传：
+
+- 逻辑模型 `gpt-image-2-1k`：下游传 `model` + `size`（比例，`16:9` / `16x9` / `16/9` 都接受，
+  缺省 `1x1`），`req_mapping` 拼成上游 `gpt-image2-1k-{比例}`。
+- `size` 缺失时兼容回落 `aspect_ratio`（按画幅字段调用的下游也能选对比例），两者都为空才用 `1x1`；
+  `size` 优先于 `aspect_ratio`。白名单外的比例归一成 `x` 形式后原样交给上游判断，不做二次校验。
+- 只接了 `1k` 档。2k / 4k 由既有逻辑模型 `gpt-image-2-2k`（绑定 #16，启用中）与
+  `gpt-image-2-4k`（绑定 #17，停用中）各自绑定，**不要再给同渠道建第二条绑定**，
+  否则同一逻辑模型会在两份映射之间随机路由。需要补 2k / 4k 时改这两条既有绑定即可，
+  `buildReqMapping(tier)` 已按档位参数化，加一条 `models` 记录就能生成映射。
+
+图生图：文字提示词作为 `messages[0].content` 的第一个 `text` 段，每张参考图各占一个独立的
+`image_url` 段（对象 `{url}` 与裸字符串都接受，空值被过滤）；没有有效参考图时 `content`
+退化为纯文本，走文生图。上游文档要求参考图 URL 必须能被上游服务器访问（建议 HTTPS 直链），
+所以下游传的 `http(s)` 链接会原样透传；要让下游直接传 base64 / data URL，
+打开该渠道的「请求 base64 转图床」开关（`channels.convert_base64_to_url`），
+网关会先把 data URL 上传成 HTTPS 链接再发给上游（该开关是渠道级，会影响同渠道的其它绑定）。
+
+返回归一：上游把结果放在 `choices[0].message.content`，常见形式是 Markdown 图片
+`![Generated Image](https://img.mcnio.com/generated/xxx.png)`；
+`resp_mapping` 把它归一到顶层 `url`（同时保留 `data[0].url` 与 `b64_json`），
+兼容裸链接、data URL、整段裸 base64，以及 OpenAI 风格的 `data[0].url` / `data[0].b64_json` /
+`image.url` / `image_urls[]`。上游限流或报错时 `content` 只是一句错误话术
+（例如「未能生成图片」），此时 `url` 输出空字符串，不会把错误话术当成图片链接返回下游。
+若上游某天改成只回内联 base64，打开该渠道的「响应 base64 转图床」开关
+（`channels.convert_resp_base64_to_url`）即可让下游拿到 http 链接，映射本身无需改动。
+
+模板与映射位于 `scripts/mcnio-gpt-image2-config.js`，配置脚本为 `scripts/add-mcnio-gpt-image2.js`
+（`--dry-run` 预览 / `--apply` 写入，要求显式设置 `EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME` 并核对连接；
+复用既有渠道、按 `model_name` 复用逻辑模型、按（逻辑模型，渠道）复用绑定，
+重复执行只更新差异字段，不删除任何既有记录，也不改动渠道开关与密钥）。
+上游模型清单可用 `node tools/probe-mcnio-image-models.js [关键字]` 复查
+（只读 `GET /v1/models`，不发起计费请求，且不打印渠道密钥）。
+
+2026-10 实测与校验：
+
+- `GET https://api.mcnio.com/v1/models` 返回 115 个模型，`gpt-image2-1k-{10 个比例}` 全部存在，
+  `gpt-image2-2k-*` 只有 `16x9` / `21x9` / `9x16`；`gpt-image-2.5-{sunburst,flare}-{1k,2k,4k}-{比例}`
+  各 10 条也在列表里，与本仓库已有配置一致。
+- `node --test test/mcnio-gpt-image2.test.js`（10 项）：覆盖 10 种比例的字面写法、`size` 缺省与
+  `aspect_ratio` 回落、上游拒收字段不下发、图生图 `text + image_url` 段形状、空参考图退化、
+  Markdown / 裸链接 / data URL 归一、错误话术不产生假链接。
+- `node tools/verify-mcnio-gpt-image2.js [网关地址]`（11 项，全部通过）：在宿主机起一个 mock 上游
+  （端口 `4611`，容器经 `host.docker.internal` 访问），临时建一条渠道 + 逻辑模型 + 绑定，
+  **映射直接取自数据库里 `gpt-image-2-1k` 生产绑定的 `req_mapping` / `resp_mapping`**，
+  走完整网关链路后无条件删除临时记录，生产渠道与绑定全程不变。实测断言了：
+  上游收到 `POST /v1/chat/completions`、`Authorization: Bearer <渠道密钥>`、
+  `model = gpt-image2-1k-16x9`（`size=16:9`）与 `gpt-image2-1k-1x1`（不传 `size`）、
+  请求体只有 `model` + `messages`、图生图 3 段 content、上游 data URL 归一、错误话术 `url` 为空串。
+- 按第 7.2 节第 11 条，**没有发送任何真实计费生成请求**：上游接口的可达性与模型名来自
+  `GET /v1/models`，请求/响应形态来自 mock 端到端校验。需要确认真实出图时，
+  可让下游对 `gpt-image-2-1k` 发一条 `size=16:9` 的 1K 请求（会真实计费）。
+- 写映射时踩到的 JSONata 2.2.2 坑（与 11.3 同源）：
+  1. 正则字面量里出现在字符类内的 `\/` 会被词法器提前当成结束符，报
+     `No terminating / in regular expression`，URL 前缀判断只能用 `$substring`；
+  2. `and` / `or` 不短路，判断「值是否可用」要先判类型再判内容；
+  3. `$exists(null)` 为真，所以 `$exists(size)` 拦不住 `size: null`
+     （会拼出 `gpt-image2-1k-null`），必须再加 `$type(size) != "null"`。
+
+### 11.10 secure-skill 图片（gpt-image-2-1k/-2k/-4k、gemini-nano-banana-2.1-1k/-2k/-4k）
+
+上游是 secure-skill（`https://token.secure-skill.com`，Bearer 鉴权，OpenAI 兼容入口要带 `/v1`），
+新建渠道 `secure-skill 图片`。上游是**多个分组协议共用同一域名**：GPT Image 走 `/v1/images/*`，
+Banana 走 Google 原生 `/v1beta/models/{model}:generateContent`，两套信封不能混用。
+
+本次接入了两组、共六个逻辑模型，**两组都按分辨率档位拆成三个逻辑模型**：
+
+| 逻辑模型 | 上游模型 ID | 上游入口 | 档位 | 绑定状态 |
+|---|---|---|---|---|
+| `gpt-image-2-1k` / `gpt-image-2-2k` / `gpt-image-2-4k` | `gpt-image-2` | `POST /v1/images/generations`（同步阻塞） | 1K / 2K / 4K | 1K、2K 启用；**4K 先停用** |
+| `gemini-nano-banana-2.1-1k` / `-2k` / `-4k` | `gemini-nano-banana-2.1`（原样使用，三档共用） | `POST /v1beta/models/gemini-nano-banana-2.1:generateContent`（同步阻塞） | 1K / 2K / 4K（由模型名写死） | 三档都启用 |
+
+档位一律由**逻辑模型名**决定，下游不用（也不能）用参数改档；下游只需要传比例
+（`size` 或 `aspect_ratio`）。这样插件可以只按模型名选档，不需要解析额外参数。
+
+配置与映射位于 `scripts/secure-skill-image-config.js`，配置脚本为
+`scripts/add-secure-skill-image.js`（`--dry-run` 预览 / `--apply` 写入，要求显式设置
+`EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME` 并核对连接）。脚本按 `name` / `base_url` 复用渠道、
+按 `model_name` 复用逻辑模型、按（逻辑模型，渠道）复用绑定，重复执行只更新差异字段，
+**从不写渠道密钥**，也不删除任何记录；只有配置里显式写 `status = 0` 的绑定
+（目前是 `gpt-image-2-4k`）会在已存在时被强制停用，`status = 1` 的绑定不会覆盖后台手动的停用。
+`gpt-image-2-1k` / `-2k` / `-4k` 是既有逻辑模型（原本只绑 MCNIO 渠道），本脚本只给它们追加一条
+指向 secure-skill 的绑定，多绑定按 `weight` 随机路由。
+
+Banana 2.1 从「单个 `gemini-nano-banana-2.1` 逻辑模型 + 下游传档位」改成三档拆分时，
+用一次性迁移脚本 `scripts/migrate-banana-21-tiers.js`（`--dry-run` / `--apply`）：
+它把裸名记录原地改名成 `-2k`（保住既有绑定 id），再补建 `-1k` / `-4k` 与其绑定，
+最后删掉裸名记录。迁移是幂等的，并且会先检查裸名记录有没有被其它渠道引用。
+
+#### 渠道开关
+
+渠道创建时同时打开两个 base64 开关（同渠道所有绑定共用，见第 5 节）：
+
+- `convert_base64_to_url = 1`：上游文档明确参考图只接受公网 HTTP(S) URL
+  （不接受 multipart / data URL / base64），所以下游传的 `data:image/...` 必须由网关
+  先上传图床换成 HTTPS 链接。
+- `convert_resp_base64_to_url = 1`：Banana 的 `generateContent` **只回内联 Base64**
+  （`candidates[].content.parts[].inlineData.data`），而下游统一模板要求 http 链接，
+  由网关在响应映射之后把它换成图床链接。
+
+#### GPT Image 2：档位放在模型名，比例由下游传
+
+上游公开模型 ID 只有 `gpt-image-2` 一个（**质量由 API Key 所属分组决定，请求里不要写质量后缀**），
+分辨率靠 `size`（宽x高）表达：命中上游预设表走该格像素与档位，表外 WxH 仅 `gpt-image-2`
+支持自定义（宽高必须都是 16 的倍数）。本网关没有把上游几十个规格名暴露给下游，
+而是按档位暴露三个逻辑模型，比例由下游 `size` 传：
+
+- 下游 `size` 传比例（`16:9`、`16x9`、`16/9` 都接受），网关在该档位的预设表里查出上游像素；
+  `size` 缺失时兼容回落 `aspect_ratio`，两者都为空用该档 `1:1`；`size` 优先于 `aspect_ratio`。
+- 下游 `size` 直接写像素（如 `1920x1088`）时原样透传，由上游按自定义尺寸判断合法性
+  （最短边 ≥ 256、最长边 ≤ 3840、宽高都是 16 的倍数，`1920x1080` 会被上游拒绝）。
+- 固定下发 `model` / `prompt` / `size` / `response_format: "url"` / `n: 1`；
+  参考图放顶层 `image`（`images` 映射过去，字符串或数组，上游最多 16 张）。
+- **`quality` / `resolution` / `duration` / `width` / `height` 一律不下发**：上游 GPT Image 2
+  不接受 `quality`（质量由分组决定），下游 `n` 也会被强制成 `1`（上游该模型只支持 1 张）。
+
+上游 `gpt-image-2` 预设表（本次按文档逐格写入 `req_mapping`）：
+
+| 比例 | 1K | 2K | 4K |
+|---|---|---|---|
+| 1:1 | 1024x1024 | 2048x2048 | 2880x2880 |
+| 3:2 | 1536x1024 | 2048x1360 | 3504x2336 |
+| 2:3 | 1024x1536 | 1360x2048 | 2336x3504 |
+| 4:3 | 1024x768 | 2048x1536 | 3264x2448 |
+| 3:4 | 768x1024 | 1536x2048 | 2448x3264 |
+| 5:4 | 1280x1024 | 2560x2048 | 3200x2560 |
+| 4:5 | 1024x1280 | 2048x2560 | 2560x3200 |
+| 16:9 | 1536x864 | 2048x1152 | 3840x2160 |
+| 9:16 | 864x1536 | 1152x2048 | 2160x3840 |
+| 2:1 | 2048x1024 | 2688x1344 | 3840x1920 |
+| 1:2 | 1024x2048 | 1344x2688 | 1920x3840 |
+| 21:9 | 2016x864 | 2688x1152 | 3840x1648 |
+| 9:21 | 864x2016 | 1152x2688 | 1648x3840 |
+
+`resp_mapping` 直接沿用上游 OpenAI 兼容形状（`data[0].url` / `data[0].b64_json`），
+归一到顶层 `url` / `b64_json` / `data[0]`；`data` 为空数组（上游视为失败）时 `url` 输出空串，
+不会凭空造链接。上游 4xx/5xx 的 `{"error":{...}}` 形状由网关按 `error_passthrough = 1` 原样透传。
+
+`gpt-image-2-4k` 的绑定按 `status = 0` 创建：上游文档声明支持 4K，但「模型是否可用以
+API Key 所属分组为准」，确认分组开通后在后台启用即可（映射本身已可用，见校验结论）。
+
+#### gemini-nano-banana-2.1：Google 原生同步入口
+
+Banana 有三套信封（原生异步 `POST /v1/images/generations` + `GET /v1/images/generations/{id}`、
+OpenAI 兼容异步、以及 `/v1beta/models/{model}:generateContent`）。本网关的同步图片入口
+（`server.js` 的 `/v1/images/generations`）**没有图片任务的异步/轮询流程**，`is_async` 也只作用于
+`/v1/videos`，所以这里只能选同步入口，最终采用 Google 原生 `generateContent`：
+
+- 上游路径带模型名，`route_path` 为 `/v1beta/models/gemini-nano-banana-2.1:generateContent`；
+  上游文档写明 `gemini-nano-banana-2.1` 按请求名原样使用。三个档位共用同一个上游模型与同一条路径，
+  逻辑模型名只是网关侧的档位标签（`-1k` / `-2k` / `-4k`），请求体里的上游模型名不变。
+- 请求体：`contents[0]` 是 `role: user`，`parts` 第一段是 `{text: prompt}`，
+  参考图各占一段；`generationConfig.responseModalities = ["TEXT","IMAGE"]`，
+  `generationConfig.imageConfig` 传**档位**（`1K` / `2K` / `4K`）与比例。
+- 档位**写死在模型名里**：`imageSize` 直接由逻辑模型决定（`-4k` 恒为 `4K`），
+  下游传 `image_size` / `resolution` / `size: "1K"` 之类都不会改变它。
+  比例来源：下游 `aspect_ratio` > `size` 里的比例 > `1:1`；档位写法的 `size`（如 `size: "2K"`）
+  不会被当成比例，按 `1:1` 处理。
+- 参考图两种形态：data URL 拆成 `inlineData{mimeType, data}`（上游文档说明 `contents` 里的
+  inlineData 会先上传再作为参考图）；公网 URL 放进 `fileData.fileUri` 原样透传。
+  合计最多 16 张。
+- 比例除通用比例（`1:1` / `16:9` / `9:16` / `3:2` / `2:3` / `4:3` / `3:4` / `4:5` / `5:4` / `21:9`）外，
+  Banana 2.1 额外支持 **4:1 / 1:4 / 8:1 / 1:8**；上游的别名写法
+  （`landscape` / `portrait` / `square` / `four-one` / `one-four` / `eight-one` / `one-eight`）
+  与 `16x9` / `16/9` 也一并归一。**不支持 9:21**，也不支持 `size: "0x0"` 跟随参考图尺寸。
+- 像素表（上游按「档位 + 比例」自己映射，网关只传档位与比例；此处记录文档值供排查）：
+
+  | 比例 | 1K | 2K | 4K |
+  |---|---|---|---|
+  | 1:1 | 1024x1024 | 2048x2048 | 4096x4096 |
+  | 16:9 | 1376x768 | 2752x1536 | 5504x3072 |
+  | 9:16 | 768x1376 | 1536x2752 | 3072x5504 |
+  | 3:2 | 1536x1024 | 3072x2048 | 6144x4096 |
+  | 2:3 | 1024x1536 | 2048x3072 | 4096x6144 |
+  | 4:3 | 1200x896 | 2400x1792 | 4800x3584 |
+  | 3:4 | 896x1200 | 1792x2400 | 3584x4800 |
+  | 5:4 | 1152x928 | 2304x1856 | 4608x3712 |
+  | 4:5 | 928x1152 | 1856x2304 | 3712x4608 |
+  | 21:9 | 1584x672 | 3168x1344 | 6336x2688 |
+  | 4:1 | 2048x512 | 4096x1024 | 8192x2048 |
+  | 1:4 | 512x2048 | 1024x4096 | 2048x8192 |
+  | 8:1 | 2816x352 | 5632x704 | 11264x1408 |
+  | 1:8 | 352x2816 | 704x5632 | 1408x11264 |
+
+- 响应：`candidates[].content.parts[].inlineData` 归一到顶层 `url`（data URL）、
+  `b64_json`、`images[]`（含 `mimeType`）与 `data[]`；文字段拼进 `revised_prompt`。
+  只有文字、没有图片（上游限流/失败话术）时 `url` 输出空串、`count` 为 0，不会造链接。
+  上游 4xx 的 `{"error":{...}}` 由 `error_passthrough = 1` 原样透传。
+- 上游只回内联 Base64，所以渠道的「响应 base64 转图床」是必需的：校验里确认图床链接
+  能真正下载回 PNG 字节。
+- 连续编辑（多轮 `generateContent` 回放完整 `candidates[0].content`）需要会话上下文，
+  不属于本网关的统一模板，未接入；需要时按上游文档在插件侧直接调上游。
+
+#### 校验与实测（2026-10）
+
+- `node --test test/secure-skill-image.test.js`（14 项，全部通过）：覆盖三个档位 × 13 个比例的
+  逐格换算、`size` / `aspect_ratio` / 缺省与像素直传、上游拒收字段不下发、参考图归一、
+  Banana 三档的「档位写死在模型名、下游传 1K/2K/4K 都不改档」与比例（含 4 个模型专属比例与全部别名）、
+  `inlineData` / `fileData` 拆分、响应归一与「错误话术不产生假链接」、
+  以及每条映射都能被本仓库 jsonata 解析。
+- `node tools/verify-secure-skill-image.js [网关地址]`（20 项，全部通过）：在宿主机起 mock 上游
+  （端口 `4612`，容器经 `host.docker.internal` 访问），临时建渠道 + 六个逻辑模型 + 六条绑定，
+  **映射直接取自数据库里这六条生产绑定**，走完整网关链路后无条件删除临时记录，
+  生产渠道与绑定全程不变。实测断言了：上游收到 `POST /v1/images/generations` 与
+  `Authorization: Bearer <渠道密钥>`、`model` 固定 `gpt-image-2`、16:9 在 1K/2K 档分别落成
+  `1536x864` / `2048x1152`、4K 档 1:1 落成 `2880x2880`、`quality` 等字段不下发、
+  http 参考图原样透传而 data URL 被图床换成链接、Banana 三档各自下发
+  `imageSize` = `1K`/`2K`/`4K`（对 `-4k` 故意传 `image_size: "1K"` 与 `resolution: "1K"` 仍落 `4K`）、
+  上游收到 `/v1beta/models/gemini-nano-banana-2.1:generateContent` 且 `imageConfig` 为
+  `{aspectRatio:"4:1",imageSize:"4K"}`、`inlineData` 归一成可下载的图床 PNG 链接、
+  返回体里的 `model` 是下游调用的逻辑模型名、只回文字时 `url` 为空串。
+- 按第 7.2 节第 11 条，**没有发送任何真实计费生成请求**：上游接口路径与模型名来自本文档，
+  请求/响应形态来自 mock 端到端校验。
+- 写这两个映射时踩到的 JSONata 2.2.2 坑（都是本仓库实测，写新映射必看）：
+  1. `$map` / `$filter` 的匿名函数体**只能是单个表达式**，里面不能写 `$x := ...;` 赋值
+     （会报 `Expected "}", got ";"`）。需要中间值时只能在函数体外用赋值语句算好，
+     函数体内用嵌套三元表达式。
+  2. `$map` 不提供 `$index` 变量（`$index` 在函数体里是 undefined），
+     想按位置关联多个数组只能在一个 `$map` 里用嵌套三元算完。
+  3. 单元素数组会被折成标量：`$map([x], ...)` 的结果是 `x` 而不是 `[x]`，
+     因此「单张参考图」会输出字符串而不是数组（上游 `image` 两种都接受，
+     但下游在写断言时要注意形状）。
+  4. 正则字面量里的 `x` / `X` 必须先 `$lowercase`，且 `/^[0-9]{2,}[xX][0-9]{2,}$/`
+     这类「像素」判断要用 2 位以上数字，否则 `16x9` 会被误判成像素。
+
+#### 首次配置后需要做的一件事
+
+渠道 `secure-skill 图片` 以 `api_key = NULL` 创建（上游文档只给了 `sk-your-key` 占位符，
+真实 Key 需要登录上游后台、在 API Keys 页创建并为该 Key 选择已开通对应图片模型的分组）。
+在网关后台该渠道里填入 Key 后即可调用；也可以由下游透传 Bearer Key。
+填 Key 后建议先用 `GET {base_url}/v1/models` 确认分组已开通 `gpt-image-2` 与
+`gemini-nano-banana-2.1`，再决定是否启用 `gpt-image-2-4k` 的绑定
+（Banana 的 `-1k` / `-2k` / `-4k` 三条绑定已全部启用）。
+
+### 11.11 MINIMAXH3（openaivideo.top）三个「采样」档位
+
+新建渠道 `MINIMAXH3 视频`（`https://openaivideo.top`，Bearer 鉴权），异步视频流程：
+
+- 提交：`POST /v1/videos/generations`（JSON 或 multipart，成功 HTTP 202 + `task_id`）；
+  轮询：`GET /v1/tasks/{task_id}`（上游建议 3~5 秒一次）；
+  下载：`GET /v1/tasks/{task_id}/download?index=0` 与
+  `GET /v1/tasks/{task_id}/file/{name}?index=0`（同一份文件，需要 Bearer，支持 Range）。
+- 鉴权头 `Authorization: Bearer <Key>`（也接受 `X-API-Key`，或只写 Key）；真实 Key 已写入
+  `channels.api_key`，可用环境变量 `MINIMAXH3_API_KEY` 覆盖。
+- 渠道字段：`channel` 用 `GET /v1/channels` 的 `name`（`default` = 显示名「低价」，
+  `lumen` 是另一条只放 SD 系列模型的渠道）。本渠道**不写** `channel`，走上游默认渠道，
+  避免把渠道名写死；这些档位都在默认渠道的模型表里。
+- 上游文档只提供事实信息；页面里 `openmvideo.top` 是文档遗留文本，本渠道按实查可用的
+  `https://openaivideo.top` 配置（该域名 `/api/config` 与 `/v1/models` 都返回 200）。
+
+三个逻辑模型名与上游 model id 同名，`req_mapping` 里固定写死；档位与上限来自该 Key
+`GET /v1/models` 的实查结果（只读、不计费）：
+
+| 逻辑模型 | 上游 model | 时长 | 分辨率 | 图片 / 视频 / 音频上限 | modes |
+|---|---|---|---|---|---|
+| `MINIMAX-H3-2.5采样-101010` | 同名 | 4~30 整数秒 | 仅 720p | 10 / 10 / 10（合计 30） | first_last_frames、multi_frame、omni_reference |
+| `MINIMAX-H3-2.5采样-301010` | 同名 | 4~30 整数秒 | 仅 720p | 30 / 10 / 10（合计 50） | first_last_frames、multi_frame、omni_reference |
+| `MINIMAX-H3-2.0采样-933` | 同名 | 4~15 整数秒 | 仅 720p | 9 / 3 / 3（合计 15） | multi_frame、omni_reference（**没有 first_last_frames**） |
+
+字段映射（下游统一模板 -> 上游）：
+
+| 下游字段 | 上游字段 | 说明 |
+|---|---|---|
+| `prompt` | `prompt` | 必填，≤8000 字符；同时把 `@imgN` / `@vidN` / `@audN` 改写成 `@image_file_N` / `@video_file_N` / `@audio_file_N` |
+| `seconds` | `duration` | 该档 4~上限的整数秒；缺失、越界（含 933 的 16+）、小数、非数字、空串一律回落 `5` |
+| `aspect_ratio` | `ratio` | 该档白名单 `21:9` / `16:9` / `3:2` / `4:3` / `1:1` / `3:4` / `2:3` / `9:16` 内原样透传，缺失或白名单外回落 `16:9`（上游文档也要求不要传 `adaptive`） |
+| `resolution` | `video_resolution` | 三个档位 `caps.res` 都只有 `720p`，固定下发 `"720p"`，下游传 `1080p` / `2k` 也不改变它 |
+| `images` | `materials[]`（`type: "image"`） | `name` = `image_file_1`…`image_file_N`，超过该档 `maxImg` 按上限截断 |
+| `videos` | `materials[]`（`type: "video"`） | `name` = `video_file_N`，按该档 `maxVid` 截断 |
+| `audios` | `materials[]`（`type: "audio"`） | `name` = `audio_file_N`，按该档 `maxAudio` 截断 |
+| 有无素材 | `function_mode` | 有素材 → `omni_reference`；没有素材 → 支持 `first_last_frames` 的档位走它（上游的文生视频路径），933 走 `omni_reference` |
+
+素材与命名要点：
+
+- 统一按 `omni_reference` 混合素材提交：下游模板没有「首帧 / 尾帧 / 多帧」这类角色字段，
+  而三个档位都支持 `omni_reference`，一条映射即可覆盖图片、视频、音频的任意组合。
+- 素材项接受字符串 URL、`{"url": "..."}` 对象、单个标量或数组；空串 / `null` / 无 `url` 的对象
+  会被丢掉；单张素材也会输出**数组**（`$append` / `[...]` 组合，避免 JSONata 单元素折成标量）。
+- 素材名固定为 `image_file_N` / `video_file_N` / `audio_file_N`：这是上游文档的「引用名是字段名」
+  约定，也是站点自身 UI（角标 `@img1` / `@vid1` / `@aud1`，提交前改写成 `@image_file_1`）的做法。
+  网关在 `req_mapping` 里做了同样的改写，所以下游 prompt 写 `@img1`、`@video_file_1` 都能对上。
+- 素材 URL 必须能被上游服务器访问；渠道打开了「请求 base64 转图床」
+  （`convert_base64_to_url = 1`），下游的 `data:image/...` 会先换成图床 HTTPS 链接。
+  **视频与音频没有对应的转换**，必须是公网 `http(s)` URL。
+
+上游返回与轮询：
+
+- 提交响应 `{task_id, id?, status: "pending", model, created_at}`（ISO 8601），
+  `resp_mapping` 取 `task_id`（兼容 `id` / `data.task_id`）；异步任务的网关任务号由
+  `server.js` 生成，`resp_mapping` 只负责把上游任务号交出来。
+- 轮询状态 `pending` / `submitted` / `generating` / `post_processing` / `finalizing` /
+  `success` / `failed`：前两个与 `queued` 归一为 `queued`，中间三个与无法识别的状态归一为
+  `processing`（不会把原始状态透传给下游），`success` → `completed`，`failed` / `canceled` →
+  `failed`。
+- 进度字段是 `progress_pct`（0~100 数字，也可能是字符串），另有 `progress_text` 文案；
+  完成时固定输出 `100`。
+- `created_at` / `completed_at` 是 ISO 8601 字符串，映射成 Unix 秒；终态缺 `completed_at`
+  时用当前时间补齐，进行中输出 `null`。
+- 失败原因在 `fail_reason`（用户可读中文，例如「内容审核未通过，请修改后重试」
+  「参考图含未认证人脸，暂不支持生成」「生成时间过长，任务已结束，费用已退回，请重新提交」）。
+  只要出现 `fail_reason` / `error` / `error_message`，**无论 `status` 停在哪个进行中状态**
+  都落成终态 `failed`；失败但没有任何可读文本时输出 `上游任务失败: <status>`，避免下游一直轮询。
+- 提交响应里那句提示性 `message`（`Task is still running; poll /v1/tasks/xxx.`）**不当作错误**，
+  所以错误识别只看 `fail_reason` / `error` / `error_message`，不看通用 `message`。
+- 结果有两个数组：`result_urls`（预览 / 播流）与 `source_urls`（高清原片，可能为空数组）。
+  上游文档明确「轮询体里的 CDN 可能过期或防盗链，落盘请走 `/v1/tasks/{id}/download`」，
+  因此完成后 `video_url` 固定拼站内下载地址
+  `https://openaivideo.top/v1/tasks/{task_id}/download?index=0`，上游直链只保留在
+  `upstream_result_url` 里供排查；没有 `task_id` 时才退回 `source_urls[0]` / `result_urls[0]`。
+
+绑定与渠道开关：
+
+- `is_async = 1`、`proxy_content = 1`（站内下载接口需要 Bearer 且支持 Range，由网关
+  `/v1/videos/{id}/content` 代理取流；`channels.content_fallback_enabled = 1`，
+  代理侧 401/403 时会再回退到站内下载接口）。
+- `poll_throttle = 1`：生成时间非常长（上游约 3.5 小时没出结果就退费结束），
+  上游文档写「默认 60 次/分钟」，而实查响应头是 `X-Ratelimit-Limit: 20`、`X-Generating-Limit: 20`
+  （并发上限 20，与站点界面显示一致），轮询与提交共用这份额度，因此更要用节流；
+  网关侧最小轮询间隔由 `POLL_MIN_INTERVAL_SECONDS`（默认 6 秒）控制，
+  下游建议 10~15 秒轮询一次。注意 `/content` 与 `/v1/videos/{id}` 共用同一套节流：
+  距上次轮询不足最小间隔时 `/content` 会返回 `{"url":""}`，稍等几秒重试即可（见 11.8 节）。
+- `error_passthrough = 1`：上游提交失败（`400` 参数无效 / `402` 积分不足 / `429` 超限）的
+  原始错误体直接透传给下游，便于排查参数问题。
+- `convert_base64_to_url = 1`：见上「素材与命名要点」；`convert_resp_base64_to_url` 保持 `0`
+  （成片是 mp4 链接，没有内联 base64）。
+
+模板与映射位于 `scripts/minimaxh3-openaivideo-config.js`，配置脚本为
+`scripts/add-minimaxh3-openaivideo.js`（`--dry-run` 预览 / `--apply` 写入，要求显式设置
+`EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME` 并核对连接；渠道按 `name` / `base_url` 复用、
+逻辑模型按 `model_name` 复用、绑定按（逻辑模型，渠道）复用，重复执行只更新差异字段，
+不覆盖已有渠道密钥、不删除任何记录）。
+映射可用 `node --test test/minimaxh3-openaivideo.test.js` 校验（12 项：档位上限、素材命名与截断、
+`@imgN` 改写、`seconds` / `aspect_ratio` / `resolution` 归一、提交与轮询映射、
+失败态与「提示性 message 不算失败」），不需要发起付费生成请求。
+
+2026-11 配置时的实测与说明（**没有发送任何真实生成请求**，生成时间很长且会计费）：
+
+- 用该 Key 实查 `GET /v1/models`（200）：`default` 渠道列出
+  `MINIMAXH3-2.0采样`、`MINIMAX-H3-2.5采样`、`MINIMAX-H3-2.0采样-933`、
+  `MINIMAX-H3-2.5采样-101010`、`MINIMAX-H3-2.5采样-301010`；本次只接入下游点名的三个档位，
+  裸名 `minimaxH3` / `MINIMAXH3-2.0采样` / `MINIMAX-H3-2.5采样` 未建逻辑模型（需要时按本节加即可）。
+- `GET /v1/tasks/{不存在的 id}` 返回 404，确认轮询路径与鉴权头形态正确（只读、不产生任务）。
+- 用三个上游 model id 各发一条**故意不合法**的 JSON 提交（`Content-Type: application/json`、
+  带 `function_mode` / `ratio` / `duration` / `video_resolution`、**不带 `prompt`**）：三条都返回
+  HTTP 400 `{"error":"prompt 不能为空"}`，说明 JSON 提交路径可用、三个 model id 都被该 Key 接受，
+  且上面这些字段没有触发参数错误；请求在参数校验阶段就被拒绝，**不会创建任务、不扣费**。
+  作为对照，乱写的 model 名返回 400 `{"error":"该渠道不支持模型: ...","supported":[...]}`，
+  `supported` 列表里包含本次接入的三个档位。
+  注意：探测时命令行必须用 UTF-8 无 BOM 的 JSON 文件（`curl --data-binary @file`），
+  否则中文 model id 会被按本地代码页发送、上游解析失败只回 `500 Internal server error`。
+- 容器内实查 `https://openaivideo.top/v1/models` 返回 200，说明镜像的 CA 证书与出网正常。
+- 配置已写入运行中的网关数据库（渠道 #39，逻辑模型 #247 / #248 / #249，绑定 #266 / #267 / #268），
+  并通过运行中容器的后台接口复核；网关按请求实时读库，**不需要重启容器**。
+- 需要真实出片时，由下游按上述三个模型名发一条请求即可（会真实计费）。上游 402/429
+  会原样透传给下游。
+- 写映射时踩到的 JSONata 2.2.2 坑（与 11.3 / 11.10 同源）：`$map` / `$filter` 的匿名函数体
+  只能是单个表达式（不能写 `$x := ...;`）；`and` 不短路，`$length` / `$match` / `$toMillis`
+  对 null、数字、非 ISO 字符串会抛错，所以每一步都先判类型再取值；`$filter(空数组)` 返回
+  `undefined`（用 `$count()` 判空是安全的）；数组切片 `[[0..N-1]]` 只在块表达式（外层括号）里
+  对变量上下界生效，因此上限用模板里的字面量生成。
+
+### 11.12 AI666 Gemini（gemini-4-argon）：OpenAI 协议转 Gemini + SSE 透传
+
+新建渠道 `AI666 Gemini`（`https://ai666.live`，Bearer），新增逻辑模型 `gemini-4-argon`，
+同步 chat 流程（`is_async=0`、`proxy_content=0`、`error_passthrough=1`）。
+
+上游是 new-api 系网关（响应头 `X-New-Api-Version` / `X-Oneapi-Request-Id`），走 **Gemini 原生协议**：
+
+- 非流式：`POST /v1beta/models/gemini-4-argon:generateContent`
+- 流式：`POST /v1beta/models/gemini-4-argon:generateContent?alt=sse`
+- 鉴权：该站实测**同时接受** `x-goog-api-key: <Key>` 与 `Authorization: Bearer <Key>`
+  （用 `generateContent` 空 body 实测两种头都返回 400 `contents is required`，不是 401），
+  因此沿用网关现有的 `bearer` 类型，**没有新增鉴权头类型**。
+- `GET /v1beta/models`（只读实查）只列出 `gemini-3.8-flash` 与 `gemini-4-argon`，本次只接后者。
+
+#### 请求转换（OpenAI -> Gemini，全部由 `req_mapping` 表达，不改网关代码）
+
+| 下游 OpenAI 字段 | 上游 Gemini 字段 | 说明 |
+|---|---|---|
+| `messages[]` | `contents[]` | `assistant` → `role: "model"`，其余非 system 角色 → `role: "user"`；`contents` 与每条的 `parts` **恒为数组**（见下「坑」） |
+| `content` 字符串 | `parts: [{ text }]` | |
+| `content[]` 里的 `text` 段 | `parts: [{ text }]` | 多个 text 段各占一个 part |
+| `content[]` 里的 `image_url` | data URL → `parts: [{ inlineData: { mimeType, data } }]`；`http(s)` URL → `parts: [{ fileData: { fileUri } }]` | 其他 part 类型被丢弃 |
+| `role: system` / `developer` | 顶层 `systemInstruction.parts[]` | 多条用空行拼接 |
+| `temperature` | `generationConfig.temperature` | |
+| `top_p` | `generationConfig.topP` | 缺省 **0.95** |
+| `max_tokens` / `max_completion_tokens` | `generationConfig.maxOutputTokens` | 数字或纯数字字符串都接受，缺省不下发 |
+| `n`（>1） | `generationConfig.candidateCount` | `n=1` 不下发 |
+| `stop`（字符串或数组） | `generationConfig.stopSequences` | |
+| `response_format.type = "json_object"` | `generationConfig.responseMimeType = "application/json"` | |
+| `stream: true` | 路由改走 `?alt=sse`，并置网关内部标记 `_stream_passthrough` | 见下「流式透传」 |
+
+`tools` / `functions` / `tool_calls` **未做转换**，需要时再补。
+
+#### 流式透传：网关新增的映射级能力
+
+原来的 `/v1/chat/completions` 只会用 axios 缓冲上游响应、再套 `resp_mapping`（JSONata 无法表达
+SSE），所以对 SSE 上游不可用。现在加了一个**按绑定可选**的能力：
+
+- `req_mapping` 在输出里带 `"_stream_passthrough": true`（同时把 `_route_path` 指向 SSE 地址）
+  即表示「这个绑定要透传」；该标记和 `_route_path` 一样属于网关元数据，**不会发给上游**
+  （已加进 `MULTIPART_META_KEYS`）。
+- 下游请求带 `stream: true`（布尔或字符串 `"true"`）且该绑定声明了透传时，网关改用
+  `responseType: "stream"` 请求上游，按上游原样把响应体 pipe 给下游，保留上游
+  `content-type`（`text/event-stream`）并加 `X-Accel-Buffering: no`；下游断开时销毁上游连接。
+- 其他绑定、以及没声明透传的绑定，行为与以前完全一致（缓冲 + `resp_mapping`）。
+- 上游非 2xx 时先缓冲错误体，再按 `error_passthrough` 原样返回状态码与错误体
+  （new-api 的形状是 `{"error":{"message":...,"type":"new_api_error","code":...}}`）。
+- 透传是**逐字节**的：下游收到的是 Gemini 的 `data: {"candidates":[...]}` 事件，
+  **不做 OpenAI delta 转换**。要 OpenAI 风格流式（`choices[0].delta`）需要再加一层转换。
+- 非流式（下游不传 `stream`）走 `:generateContent`，由 `resp_mapping` 把 Gemini JSON 归一成
+  OpenAI 风格 `chat.completion`（`choices[0].message.content` 由 `candidates[0].content.parts[].text`
+  拼接，`finishReason` 小写进 `finish_reason`，`usageMetadata` 进 `usage`）。
+
+#### 配置与验证
+
+模板与映射位于 `scripts/ai666-gemini-config.js`，写入脚本为 `scripts/add-ai666-gemini.js`
+（`--dry-run` 预览 / `--apply` 写入，要求显式设置 `EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME`；
+渠道按 `name` / `base_url` 复用、逻辑模型按 `model_name` 复用、绑定按（逻辑模型，渠道）复用，
+重复执行只更新差异字段、不覆盖已有密钥）。
+
+- `node --test test/ai666-gemini.test.js`（10 项）：请求转换（contents / systemInstruction /
+  generationConfig / 多模态 part）、流式与非流式的路由与标记、响应归一、以及网关
+  `wantsStreamedResponse` / `isStreamPassthroughPayload` 两个纯函数。
+- `node tools/verify-ai666-gemini.js [网关地址] [网关密钥] [mock 端口]`（15 项，全部通过）：
+  在宿主机起 mock Gemini 上游（端口 4621，容器经 `host.docker.internal` 访问），
+  临时建渠道 + 逻辑模型 + 绑定（**映射逐字取自生产绑定**），走完整网关链路后无条件删除临时记录。
+  实测断言：流式请求上游收到 `/v1beta/models/gemini-4-argon:generateContent?alt=sse`、
+  `Authorization: Bearer <渠道密钥>`、纯 Gemini 报文（`_route_path` / `_stream_passthrough`
+  等网关字段没有泄漏）、SSE 逐字节透传；非流式收到不带 `alt=sse` 的路径且响应归一成
+  `chat.completion`；上游 429 时状态码与 `new_api_error` 错误体原样透传。
+- 2026-10 真实调用（各一次、`max_tokens` 很小）：非流式经网关返回
+  `{"object":"chat.completion","model":"gemini-4-argon","choices":[{"message":{"content":"OK"}}],"usage":{...}}`；
+  流式经网关返回 `Content-Type: text/event-stream` + `Transfer-Encoding: chunked`，
+  内容是上游 Gemini 的 `data: {"candidates":...}` 事件，确认透传链路可用。
+- 本次为支持 SSE 透传改了 `server.js`（新增 `_stream_passthrough` 透传分支与
+  `res.headersSent` 兜底），因此**需要重新构建并重启网关容器**才生效：
+  `docker compose up -d --build gateway`。
+
+写映射时又踩到的 JSONata 2.2.2 坑：`$map` / `$filter` 的结果是**序列**，只有单个元素时会折成
+标量，导致 `contents` / `parts` 变成对象而不是数组（Gemini 要求数组）。修法是显式用数组构造器
+包一层：`[$map(...)]`、`[$filter($map(...), ...)]`；`$join(undefined, "")` 返回 `undefined`，
+要再判一次 `$type(...) = "string"` 才能保证 `content` 恒为字符串。
+
+
