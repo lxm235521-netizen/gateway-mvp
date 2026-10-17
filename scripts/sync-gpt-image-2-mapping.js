@@ -4,8 +4,9 @@
 // 背景：渠道「gpt图片生成」(channel 3, binding #2)、「gpt图片生成 Klong」
 // (channel 22, binding #192) 与「gpt图片生成 688」(img.688.qzz.io) 本来共用同一份映射，
 // 只为这些渠道同时支持「统一模板」和「OpenAI messages 风格」两种下游请求，需要一起更新。
-// 688 渠道的 resp_mapping 在此基础上扩展了 base64 归一，因此不同步 resp_mapping 到它，
-// 只同步 req_mapping（它必须与 Klong 逐字相同）。
+// resp_mapping 现在两个配置都由 scripts/image-response-mapping.js 生成，内容逐字相同；
+// 这里仍按「688 用 688 的、其它用 Klong 的」分别取值，方便以后任一侧再定制。
+// 注意：本脚本只覆盖 gpt-image-2；gpt-image-2.5 用 scripts/sync-image-response-mapping.js。
 //
 // 安全边界：
 //   - 默认只更新「当前映射与旧版映射逐字相同」的绑定，避免误伤其它渠道
@@ -54,8 +55,8 @@ async function main() {
 
     const targets = [];
     for (const binding of bindings) {
-        // 688 渠道有自己的扩展 resp_mapping（多了 base64 归一），不能覆盖成 Klong 那版，
-        // 只同步它的 req_mapping。
+        // 688 渠道先取自己的 resp_mapping（目前与 Klong 都来自 image-response-mapping.js，内容相同），
+        // 以后若 688 再定制，也不会被 Klong 那版覆盖。
         const isImg688 = binding.channel_name === img688.CHANNEL_NAME;
         const expectedResp = isImg688 ? img688.resp_mapping : resp_mapping;
         const currentReq = String(binding.req_mapping || '');

@@ -110,7 +110,7 @@ const mapping = jsonata(req_mapping);
 const response = jsonata(resp_mapping);
 const plain = value => JSON.parse(JSON.stringify(value));
 
-const chatUrl = `${BASE_URL}/v1/chat/completions`;
+const generationsUrl = `${BASE_URL}/v1/images/generations`;
 const editsUrl = `${BASE_URL}/v1/images/edits`;
 
 test('渠道定义指向 img.688.qzz.io，带 Bearer 密钥并开启响应侧 base64 转链接', () => {
@@ -144,18 +144,18 @@ test('请求映射与「gpt图片生成」/ Klong 逐字相同', () => {
     assert.ok(legacy_req_mappings.every(item => item !== req_mapping));
 });
 
-test('统一模板 · 无参考图 -> JSON chat/completions，response_format 是字符串对象', async () => {
+test('统一模板 · 无参考图 -> JSON images/generations（顶层 prompt），response_format 是字符串', async () => {
     for (const images of [undefined, []]) {
         const mapped = await mapping.evaluate({ model: 'gpt-image-2', prompt: '一只猫', images, size: '16:9' });
-        assert.equal(resolveUpstreamUrl({ base_url: channel.base_url }, mapped), chatUrl);
+        assert.equal(resolveUpstreamUrl({ base_url: channel.base_url }, mapped), generationsUrl);
         const request = await buildPostOptions(channel.api_key, mapped, 'bearer');
         assert.deepEqual(plain(request.data), {
             model: 'gpt-image-2',
-            response_format: { type: 'url' },
+            prompt: '一只猫',
             size: '1792x1024',
             quality: 'high',
             n: 1,
-            messages: [{ role: 'user', content: '一只猫' }]
+            response_format: 'url'
         });
     }
 });
@@ -176,7 +176,7 @@ test('统一模板 · 有参考图 -> multipart images/edits，image 按文件�
     }
 });
 
-test('OpenAI 风格 · messages[0].content 是字符串 -> 文生图', async () => {
+test('OpenAI 风格 · messages[0].content 是字符串 -> 文生图（提示词进顶层 prompt）', async () => {
     const mapped = await mapping.evaluate({
         model: 'gpt-image-2',
         response_format: { type: 'url' },
@@ -185,15 +185,15 @@ test('OpenAI 风格 · messages[0].content 是字符串 -> 文生图', async () 
         n: 1,
         messages: [{ role: 'user', content: '生成一张真实摄影风格的城市夜景' }]
     });
-    assert.equal(resolveUpstreamUrl({ base_url: channel.base_url }, mapped), chatUrl);
+    assert.equal(resolveUpstreamUrl({ base_url: channel.base_url }, mapped), generationsUrl);
     const request = await buildPostOptions(channel.api_key, mapped, 'bearer');
     assert.deepEqual(plain(request.data), {
         model: 'gpt-image-2',
-        response_format: { type: 'url' },
+        prompt: '生成一张真实摄影风格的城市夜景',
         size: '1792x1024',
         quality: 'high',
         n: 1,
-        messages: [{ role: 'user', content: '生成一张真实摄影风格的城市夜景' }]
+        response_format: 'url'
     });
 });
 
@@ -223,7 +223,7 @@ test('缺省参数补齐：quality=high、n=1、response_format=url，size 画�
     const bare = await mapping.evaluate({ model: 'gpt-image-2', prompt: '一只猫' });
     assert.equal(bare.quality, 'high');
     assert.equal(bare.n, 1);
-    assert.equal(bare.response_format.type, 'url');
+    assert.equal(bare.response_format, 'url');
     assert.equal(bare.size, '1024x1024');
 
     for (const quality of ['', '   ', null]) {
@@ -232,7 +232,7 @@ test('缺省参数补齐：quality=high、n=1、response_format=url，size 画�
     }
     for (const response_format of [null, {}, '', { type: null }]) {
         const mapped = await mapping.evaluate({ prompt: 'x', response_format });
-        assert.equal(mapped.response_format.type, 'url', `response_format=${JSON.stringify(response_format)}`);
+        assert.equal(mapped.response_format, 'url', `response_format=${JSON.stringify(response_format)}`);
     }
 
     const ratios = { '16:9': '1792x1024', '9:16': '1024x1792', '1:1': '1024x1024', '4:3': '1536x1152', '3:4': '1152x1536' };
@@ -242,38 +242,45 @@ test('缺省参数补齐：quality=high、n=1、response_format=url，size 画�
     assert.equal((await mapping.evaluate({ prompt: 'x', size: '2048x2048' })).size, '2048x2048');
 });
 
-test('响应归一 · data[0].url / data[0].b64_json', async () => {
+test('响应归一 · url 模式给链接，b64_json 模式把 base64 放进 url', async () => {
     assert.deepEqual(plain(await response.evaluate({
+        created: 1791167407,
         data: [{ url: 'https://cdn.example.com/a.png' }]
-    })), { model: 'gpt-image-2', url: 'https://cdn.example.com/a.png', b64_json: null, data: [{ url: 'https://cdn.example.com/a.png', b64_json: null }] });
+    })), { model: 'gpt-image-2', url: 'https://cdn.example.com/a.png' });
 
-    const fromB64 = plain(await response.evaluate({ data: [{ b64_json: pngBase64 }] }));
-    assert.equal(fromB64.url, pngBase64);
-    assert.equal(fromB64.b64_json, pngBase64);
+    // response_format=b64_json：上游返回里根本没有 url，只有 data[0].b64_json。
+    // 旧映射只取 data[0].url，下游会只剩 { model, created }；这里锁死 url 必须拿到 base64。
+    assert.deepEqual(plain(await response.evaluate({
+        created: 1791167407,
+        data: [{ revised_prompt: '一只猫', b64_json: pngBase64, width: 1024, height: 1024 }]
+    })), { model: 'gpt-image-2', url: pngBase64 });
+
+    // 上游同时给 url 与 b64_json 时优先返回链接
+    assert.equal((await response.evaluate({
+        data: [{ url: 'https://cdn.example.com/a.png', b64_json: bigPngBase64 }]
+    })).url, 'https://cdn.example.com/a.png');
 });
 
 test('响应归一 · chat/completions 的 Markdown 图片、data URL、裸 base64', async () => {
-    const markdown = plain(await response.evaluate({
+    assert.equal((await response.evaluate({
         choices: [{ message: { content: '![image_1](https://cdn.example.com/b.png)' } }]
-    }));
-    assert.equal(markdown.url, 'https://cdn.example.com/b.png');
+    })).url, 'https://cdn.example.com/b.png');
 
-    const fromDataUrl = plain(await response.evaluate({
+    assert.equal((await response.evaluate({
         choices: [{ message: { content: dataUrl } }]
-    }));
-    assert.equal(fromDataUrl.url, dataUrl);
-    assert.equal(fromDataUrl.b64_json, pngBase64);
+    })).url, pngBase64);
 
-    const fromRaw = plain(await response.evaluate({
-        choices: [{ message: { content: `\n  ${pngBase64}\n` } }]
-    }));
-    assert.equal(fromRaw.url, pngBase64);
-    assert.equal(fromRaw.b64_json, pngBase64);
+    assert.equal((await response.evaluate({
+        choices: [{ message: { content: `![image_1](${bigDataUrl})` } }]
+    })).url, bigPngBase64);
 
-    const fromParts = plain(await response.evaluate({
+    assert.equal((await response.evaluate({
+        choices: [{ message: { content: `\n  ${bigPngBase64}\n` } }]
+    })).url, bigPngBase64);
+
+    assert.equal((await response.evaluate({
         choices: [{ message: { content: [{ type: 'text', text: dataUrl }] } }]
-    }));
-    assert.equal(fromParts.url, dataUrl);
+    })).url, pngBase64);
 });
 
 test('响应归一 · 上游报错话术不会被当成图片链接', async () => {
@@ -283,16 +290,14 @@ test('响应归一 · 上游报错话术不会被当成图片链接', async () =
         { error: { message: 'rate limited' } },
         { choices: [{ message: { content: '请提供更多细节' } }] }
     ]) {
-        const result = plain(await response.evaluate(payload));
-        assert.equal(result.url, '', JSON.stringify(payload));
-        assert.equal(result.b64_json, null);
+        assert.deepEqual(plain(await response.evaluate(payload)), { model: 'gpt-image-2', url: '' }, JSON.stringify(payload));
     }
 });
 
 test('响应归一 · image 包装、image_urls 与顶层 url 也被兼容', async () => {
     assert.equal((await response.evaluate({ image_urls: ['https://cdn.example.com/c.png'] })).url, 'https://cdn.example.com/c.png');
     assert.equal((await response.evaluate({ image: { url: 'https://cdn.example.com/d.png' } })).url, 'https://cdn.example.com/d.png');
-    assert.equal((await response.evaluate({ image: { data: [{ b64_json: pngBase64 }] } })).b64_json, pngBase64);
+    assert.equal((await response.evaluate({ image: { data: [{ b64_json: pngBase64 }] } })).url, pngBase64);
     // 顶层裸 url 不在归一范围内，避免把错误体的 url 字段当成图片
     assert.equal((await response.evaluate({ url: 'https://cdn.example.com/e.png' })).url, '');
 });

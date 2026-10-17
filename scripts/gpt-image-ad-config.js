@@ -125,12 +125,13 @@ const req_mapping = `(
   }
 )`;
 
-// 上游成图在 data[0].url（data URL）；也兼容只给 data[0].b64_json 的形态，
-// 以及 chat 分支的 Markdown 图片。空响应 / 错误体不造链接。
-const resp_mapping = `{
-  "model": "gpt-image-2",
-  "url": $exists(data[0].url) ? data[0].url : ($type(data[0].b64_json) = "string" ? "data:image/png;base64," & data[0].b64_json : $substringBefore($substringAfter(choices[0].message.content, "("), ")"))
-}`;
+// 上游成图在 data[0].url（data URL）；统一响应映射（scripts/image-response-mapping.js）
+// 会把它拆成裸 base64 放进 url，`response_format=url` 时 url 就是 http 链接。
+// 响应固定只有 { model, url }；本渠道 convert_resp_base64_to_url=1，所以 base64 随后会被换成
+// 图床 HTTPS 链接再返回下游；空响应 / 错误体不会造链接（url 为空字符串）。
+const { buildImageResponseMapping } = require('./image-response-mapping');
+
+const resp_mapping = buildImageResponseMapping(UPSTREAM_MODEL);
 
 const bindings = models.map(model => ({
     model_name: model.model_name,

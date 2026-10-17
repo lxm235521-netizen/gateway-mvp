@@ -4,9 +4,9 @@
 //   GET /v1/models 返回 gpt-image-2 / gpt-image-2.5 / gpt-image-2.5-flare /
 //   gpt-image-2.5-sunburst，声明入口 ["image-generation", "openai"]。
 //
-// 本渠道复用既有逻辑模型 gpt-image-2，与「gpt图片生成」（http://154.9.235.100:3006）
+// 本渠道复用既有逻辑模型 gpt-image-2，与「gpt图片生成」（http://154.44.9.233:8010）
 // 和「gpt图片生成 Klong」（https://api.klong.lat）使用**完全相同**的 req_mapping：
-//   无参考图 -> 上游 POST /v1/chat/completions（response_format 传 {type:"url"}）
+//   无参考图 -> 上游 POST /v1/images/generations（JSON，response_format 传字符串 "url"）
 //   有参考图 -> 上游 POST /v1/images/edits（multipart，image 可重复）
 // 下游两种形态（网关统一模板 / OpenAI messages 风格）都归一成上面两种上游请求，
 // 因此下游不需要为新渠道做任何改动；多个绑定之间按 weight 随机路由。
@@ -32,6 +32,8 @@ const BASE_URL = process.env.IMG688_BASE_URL || 'https://img.688.qzz.io';
 const DEFAULT_API_KEY = 'sk-ywsrW6Ht3iNGbCH77ajWKN1zuX1jFu1ZlH5EoKtuHm1Pymnt';
 const UPSTREAM_MODEL_NAME = 'gpt-image-2';
 const LOGICAL_MODEL_NAME = 'gpt-image-2';
+
+const { buildImageResponseMapping } = require('./image-response-mapping');
 
 const channels = [
     {
@@ -100,68 +102,95 @@ const req_mapping = `(
       { "field": "image", "source": $img, "filename": "image-" & $string($index + 1) }
     }))
   } : {
-    "_route_path": "/v1/chat/completions",
+    "_route_path": "/v1/images/generations",
     "model": "${UPSTREAM_MODEL_NAME}",
-    "response_format": { "type": $rf },
+    "prompt": $promptText,
     "size": $mappedSize,
     "quality": $q,
     "n": $count,
-    "messages": [{ "role": "user", "content": $promptText }]
+    "response_format": $rf
   }
 )`;
 
 // 归一顺序：OpenAI data[0] -> image 包装 -> image_urls[] -> choices[].message.content。
 // content 只在「看起来是图片」时才采用：Markdown 图片、data URL 或整段裸 base64。
-// 上游限流/报错时 content 只是一句错误文本，此时 url 必须留空，不能把错误话术当图片链接返回下游。
+// 上游限流/报错时 content 只是一句错误文本，此时 url 是空串，
+// 不能把错误话术当图片链接返回下游。
 //
-// 这里刻意不用正则：本仓库 JSONata 2.2.2 有两个坑。
-//   1. $s ~> /re/ 返回 {match,start,end} 对象，在布尔上下文里恒为假，只有 $match($s, /re/)
-//      才返回可用于判断的序列，而 $match 的第二个参数不接受字符串形式的 pattern。
-//   2. 正则字面量里出现在字符类内部的 \\/ 会被词法器提前当成结束符，
-//      /[^)\\s]/ 这类写法直接报 "No terminating / in regular expression"。
-// 因此图片形态判断统一用 $contains / $length / $match($s, /^https?:\\/\\//) 表达。
-const resp_mapping = `(
-  $content := $exists(choices) and $count(choices) > 0 ? choices[0].message.content : null;
-  $contentText := $type($content) = "string" ? $trim($content) : "";
-  $markdown := $contentText != "" ? $trim($substringBefore($substringAfter($contentText, "]("), ")")) : "";
-  $markdownIsImage := $markdown != "" and ($markdown ~> $substring(0, 7) = "http://" or $markdown ~> $substring(0, 8) = "https://");
-  $markdownDataRaw := $contains($markdown, "data:image/") ? $substringAfter($markdown, "data:image/") : "";
-  $markdownDataUrl := $markdownDataRaw != "" ? "data:image/" & $markdownDataRaw : "";
-  $contentRaw := $type($content) = "array"
-    ? $join($filter($map($content, function($p) { $type($p) = "object" ? $string($p.text) : $string($p) }), function($t) { $t != "" }), " ")
-    : "";
-  $candidate := $markdownIsImage ? $markdown
-    : ($markdownDataUrl != "" ? $markdownDataUrl
-    : ($contentText != "" ? $contentText : $contentRaw));
-  $isDataUrl := $contains($candidate, "data:image/");
-  $isRawBase64 := $length($candidate) >= 32 and $not($contains($candidate, " ")) and $match($candidate, /^[A-Za-z0-9+\\/]+={0,2}$/);
-  $candidateIsImage := $isDataUrl or $isRawBase64 or ($candidate ~> $substring(0, 7) = "http://" or $candidate ~> $substring(0, 8) = "https://");
-
-  $url := $exists(data[0].url) ? $string(data[0].url)
-    : ($exists(data[0].b64_json) ? $string(data[0].b64_json)
-    : ($exists(image.data[0].url) ? $string(image.data[0].url)
-    : ($exists(image.data[0].b64_json) ? $string(image.data[0].b64_json)
-    : ($exists(image.url) ? $string(image.url)
-    : ($exists(image_urls) and $count(image_urls) > 0 ? $string(image_urls[0])
-    : ($candidateIsImage ? $candidate : ""))))));
-
-  $b64 := $exists(data[0].b64_json) ? $string(data[0].b64_json)
-    : ($exists(image.data[0].b64_json) ? $string(image.data[0].b64_json)
-    : ($isRawBase64 ? $candidate
-    : ($isDataUrl ? $substringAfter($candidate, ",") : null)));
-
-  {
-    "model": "${LOGICAL_MODEL_NAME}",
-    "url": $url,
-    "b64_json": $b64,
-    "data": [{ "url": $url, "b64_json": $b64 }]
-  }
-)`;
+// 返回体统一由 scripts/image-response-mapping.js 生成，与 Klong 的 gpt-image-2 契约完全一致：
+//   响应只有 { model, url }；url 模式 url 是 http 链接，b64_json 模式 url 是裸 base64。
+//   本渠道 convert_resp_base64_to_url=1，所以 base64 随后会被
+//   换成图床 https 链接（第 11.6 节），下游仍然只看到链接；下游显式要 b64 的渠道请用 conv=0 的绑定。
+const resp_mapping = buildImageResponseMapping(LOGICAL_MODEL_NAME);
 
 // 本渠道发布过的历史请求映射版本。同步脚本 / 复查脚本用它判断某个绑定是否与本渠道同源，
 // 避免把别的渠道（例如 YuanAI 4K 专用映射）当成自己的旧版覆盖掉。
 // 当前版本与 klong 配置逐字相同，因此这里登记的是更早的历史版本。
-const legacy_req_mappings = [];
+const legacy_req_mappings = [
+    // v5：文生图曾走上游 /v1/chat/completions（chat 接口可能回内联 base64），已改为 /v1/images/generations。
+    `(
+  $ratioMap := {"16:9":"1792x1024", "9:16":"1024x1792", "1:1":"1024x1024", "4:3":"1536x1152", "3:4":"1152x1536"};
+  $mappedSize := $lookup($ratioMap, size) ? $lookup($ratioMap, size) : (size ? size : "1024x1024");
+
+  $content := $exists(messages) and $type(messages) = "array" and $count(messages) > 0 ? messages[0].content : null;
+  $textFromMessages := $type($content) = "string" ? $trim($content) : "";
+  $parts := $type($content) = "array" ? $content : [];
+  $textFromParts := $join($filter($map($filter($parts, function($p) { $type($p) = "object" and $p.type = "text" }), function($p) { $trim($string($p.text)) }), function($t) { $t != "" }), " ");
+  $imagesFromParts := $map(
+    $filter($parts, function($p) {
+      $type($p) = "object" and $p.type = "image_url" and $exists($p.image_url.url) and $string($p.image_url.url) != ""
+    }),
+    function($p) { $string($p.image_url.url) }
+  );
+  $promptText := $exists(prompt) and $string(prompt) != "" ? $string(prompt)
+    : ($textFromMessages != "" ? $textFromMessages
+    : ($textFromParts != "" ? $textFromParts
+    : ($exists(text) and $string(text) != "" ? $string(text) : "")));
+
+  $rawImages := $append(
+    $exists(images) and $type(images) = "array" ? images : ($exists(images) ? [images] : []),
+    $imagesFromParts
+  );
+  $refImages := $map(
+    $filter($rawImages, function($i) {
+      ($type($i) = "object" and $exists($i.url) and $string($i.url) != "")
+        or ($type($i) != "object" and $exists($i) and $string($i) != "" and $string($i) != "null")
+    }),
+    function($i) { $type($i) = "object" ? $string($i.url) : $string($i) }
+  );
+  $hasImages := $count($refImages) > 0;
+
+  $rfRaw := $type(response_format) = "string" ? response_format : response_format.type;
+  $rf := $type($rfRaw) = "string" ? ($trim($rfRaw) != "" ? $trim($rfRaw) : "url") : "url";
+  $qt := $type(quality) = "string" ? $trim(quality) : quality;
+  $q := $exists($qt) and $qt != null and $string($qt) != "" ? $qt : "high";
+  $count := $exists(n) and n != null ? n : 1;
+
+  $hasImages ? {
+    "_route_path": "/v1/images/edits",
+    "_request_format": "multipart/form-data",
+    "fields": {
+      "model": "gpt-image-2",
+      "prompt": $promptText,
+      "size": $mappedSize,
+      "quality": $q,
+      "n": $count,
+      "response_format": $rf
+    },
+    "files": $append([], $map($refImages, function($img, $index) {
+      { "field": "image", "source": $img, "filename": "image-" & $string($index + 1) }
+    }))
+  } : {
+    "_route_path": "/v1/chat/completions",
+    "model": "gpt-image-2",
+    "response_format": $rf,
+    "size": $mappedSize,
+    "quality": $q,
+    "n": $count,
+    "messages": [{ "role": "user", "content": $promptText }]
+  }
+)`
+];
 
 const models = [
     {

@@ -25,7 +25,7 @@ const mapping = jsonata(req_mapping);
 const response = jsonata(resp_mapping);
 const plain = value => JSON.parse(JSON.stringify(value));
 
-const chatUrl = 'https://api.klong.lat/v1/chat/completions';
+const generationsUrl = 'https://api.klong.lat/v1/images/generations';
 const editsUrl = 'https://api.klong.lat/v1/images/edits';
 
 test('渠道定义指向 api.klong.lat 且带 Bearer 密钥', () => {
@@ -44,18 +44,18 @@ test('渠道定义指向 api.klong.lat 且带 Bearer 密钥', () => {
     assert.equal(bindings[0].status, 1);
 });
 
-test('统一模板 · 无参考图 -> JSON chat/completions，response_format 是字符串', async () => {
+test('统一模板 · 无参考图 -> JSON images/generations（顶层 prompt），response_format 是字符串', async () => {
     for (const images of [undefined, []]) {
         const mapped = await mapping.evaluate({ model: 'gpt-image-2', prompt: '一只猫', images, size: '16:9' });
-        assert.equal(resolveUpstreamUrl({ base_url: channel.base_url }, mapped), chatUrl);
+        assert.equal(resolveUpstreamUrl({ base_url: channel.base_url }, mapped), generationsUrl);
         const request = await buildPostOptions(channel.api_key, mapped, 'bearer');
         assert.deepEqual(plain(request.data), {
             model: 'gpt-image-2',
-            response_format: { type: 'url' },
+            prompt: '一只猫',
             size: '1792x1024',
             quality: 'high',
             n: 1,
-            messages: [{ role: 'user', content: '一只猫' }]
+            response_format: 'url'
         });
     }
 });
@@ -81,7 +81,7 @@ test('统一模板 · 有参考图 -> multipart images/edits，image 按文件�
     }
 });
 
-test('OpenAI 风格 · messages[0].content 是字符串 -> 文生图', async () => {
+test('OpenAI 风格 · messages[0].content 是字符串 -> 文生图（提示词进顶层 prompt）', async () => {
     const mapped = await mapping.evaluate({
         model: 'gpt-image-2',
         response_format: { type: 'url' },
@@ -90,15 +90,15 @@ test('OpenAI 风格 · messages[0].content 是字符串 -> 文生图', async () 
         n: 1,
         messages: [{ role: 'user', content: '生成一张真实摄影风格的城市夜景，电影感，高清细节，自然光影' }]
     });
-    assert.equal(resolveUpstreamUrl({ base_url: channel.base_url }, mapped), chatUrl);
+    assert.equal(resolveUpstreamUrl({ base_url: channel.base_url }, mapped), generationsUrl);
     const request = await buildPostOptions(channel.api_key, mapped, 'bearer');
     assert.deepEqual(plain(request.data), {
         model: 'gpt-image-2',
-        response_format: { type: 'url' },
+        prompt: '生成一张真实摄影风格的城市夜景，电影感，高清细节，自然光影',
         size: '1792x1024',
         quality: 'high',
         n: 1,
-        messages: [{ role: 'user', content: '生成一张真实摄影风格的城市夜景，电影感，高清细节，自然光影' }]
+        response_format: 'url'
     });
 });
 
@@ -145,7 +145,7 @@ test('OpenAI 风格 · 多个 text 段拼接，空段忽略', async () => {
         ] }]
     });
     const request = await buildPostOptions(channel.api_key, mapped, 'bearer');
-    assert.equal(plain(request.data).messages[0].content, '前半句 后半句');
+    assert.equal(plain(request.data).prompt, '前半句 后半句');
 });
 
 test('顶层 prompt/images 与 messages 混用时合并（模板优先）', async () => {
@@ -182,13 +182,13 @@ test('参考图对象形式 {url} 也支持，空值被过滤', async () => {
     const none = await mapping.evaluate({
         prompt: 'x', images: [], messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }]
     });
-    assert.equal(none._route_path, '/v1/chat/completions');
+    assert.equal(none._route_path, '/v1/images/generations');
 });
 
 test('response_format 兼容字符串与对象，画幅换算与缺省值正确', async () => {
-    assert.equal((await mapping.evaluate({ prompt: 'x', response_format: 'b64_json' })).response_format.type, 'b64_json');
-    assert.equal((await mapping.evaluate({ prompt: 'x', response_format: { type: 'b64_json' } })).response_format.type, 'b64_json');
-    assert.equal((await mapping.evaluate({ prompt: 'x' })).response_format.type, 'url');
+    assert.equal((await mapping.evaluate({ prompt: 'x', response_format: 'b64_json' })).response_format, 'b64_json');
+    assert.equal((await mapping.evaluate({ prompt: 'x', response_format: { type: 'b64_json' } })).response_format, 'b64_json');
+    assert.equal((await mapping.evaluate({ prompt: 'x' })).response_format, 'url');
     assert.equal((await mapping.evaluate({ prompt: 'x' })).quality, 'high');
     assert.equal((await mapping.evaluate({ prompt: 'x' })).n, 1);
     assert.equal((await mapping.evaluate({ prompt: 'x', n: 3, quality: 'low' })).n, 3);
@@ -201,10 +201,19 @@ test('response_format 兼容字符串与对象，画幅换算与缺省值正确'
     assert.equal((await mapping.evaluate({ prompt: 'x', size: '2048x2048' })).size, '2048x2048');
 });
 
-test('上游 response_format 对象形式的 400 已被修正（不再套两层）', async () => {
-    const mapped = await mapping.evaluate({ prompt: 'x', response_format: { type: 'url' } });
-    assert.equal(typeof mapped.response_format.type, 'string');
-    assert.equal(mapped.response_format.type, 'url');
+test('文生图走上游 images/generations，且 response_format 一律是字符串', async () => {
+    for (const response_format of ['url', { type: 'url' }, undefined]) {
+        const mapped = await mapping.evaluate({ prompt: 'x', response_format });
+        assert.equal(mapped._route_path, '/v1/images/generations', JSON.stringify(response_format));
+        assert.equal(typeof mapped.response_format, 'string', JSON.stringify(response_format));
+        assert.equal(mapped.response_format, 'url');
+        // 上游 images/generations 是 OpenAI 图片接口：提示词在顶层 prompt，不传 messages。
+        assert.equal(mapped.prompt, 'x');
+        assert.equal('messages' in mapped, false);
+    }
+    // 上游 Go 结构体把 response_format.type 声明成 string，对象形式会被 400 拒绝。
+    const mapped = await mapping.evaluate({ prompt: 'x', response_format: 'b64_json' });
+    assert.equal(mapped.response_format, 'b64_json');
 });
 
 test('缺省参数必须补上：quality 强制 high，n 缺省 1，response_format 缺省 url', async () => {
@@ -212,7 +221,7 @@ test('缺省参数必须补上：quality 强制 high，n 缺省 1，response_for
     const bare = await mapping.evaluate({ model: 'gpt-image-2', prompt: '一只猫' });
     assert.equal(bare.quality, 'high');
     assert.equal(bare.n, 1);
-    assert.equal(bare.response_format.type, 'url');
+    assert.equal(bare.response_format, 'url');
 
     // quality 是空串 / null / 空白 都要补成 high（$exists 对 null 也算存在，必须显式判 null）
     for (const quality of ['', '   ', null, undefined]) {
@@ -229,14 +238,14 @@ test('缺省参数必须补上：quality 强制 high，n 缺省 1，response_for
     // response_format 的 null / 空对象也要回落 url
     for (const response_format of [null, {}, '', { type: null }, { type: '  ' }]) {
         const mapped = await mapping.evaluate({ prompt: 'x', response_format });
-        assert.equal(mapped.response_format.type, 'url', `response_format=${JSON.stringify(response_format)}`);
+        assert.equal(mapped.response_format, 'url', `response_format=${JSON.stringify(response_format)}`);
     }
 
     // 显式给出的值必须保留
     const explicit = await mapping.evaluate({ prompt: 'x', quality: 'low', n: 3, response_format: 'b64_json' });
     assert.equal(explicit.quality, 'low');
     assert.equal(explicit.n, 3);
-    assert.equal(explicit.response_format.type, 'b64_json');
+    assert.equal(explicit.response_format, 'b64_json');
 });
 
 test('历次发布的 req_mapping 都能正常解析，且与当前版本互不相同', async () => {
@@ -254,11 +263,23 @@ test('历次发布的 req_mapping 都能正常解析，且与当前版本互不�
     assert.equal(new Set(legacy_req_mappings).size, legacy_req_mappings.length);
 });
 
-test('提交响应归一到顶层 url，兼容 data[0].url 与 Markdown 图片', async () => {    assert.deepEqual(plain(await response.evaluate({
+test('提交响应归一：url 模式给链接，b64_json 模式把 base64 放进 url', async () => {
+    assert.deepEqual(plain(await response.evaluate({
+        created: 1791167407,
         data: [{ url: 'https://pub-13fd1d3607a441b4a9d232b3a223f5f6.r2.dev/images/a.png' }]
     })), { model: 'gpt-image-2', url: 'https://pub-13fd1d3607a441b4a9d232b3a223f5f6.r2.dev/images/a.png' });
 
     assert.deepEqual(plain(await response.evaluate({
+        created: 1791167407,
         choices: [{ message: { content: '![image_1](https://pub-13fd1d3607a441b4a9d232b3a223f5f6.r2.dev/images/b.png)' } }]
     })), { model: 'gpt-image-2', url: 'https://pub-13fd1d3607a441b4a9d232b3a223f5f6.r2.dev/images/b.png' });
+
+    // response_format=b64_json 时上游只回 data[0].b64_json（没有 url）：
+    // base64 必须放进下游唯一的 url 字段，否则下游只剩 { model, created }。
+    const fromB64 = plain(await response.evaluate({
+        created: 1791167407,
+        data: [{ revised_prompt: '一只猫', b64_json: png.toString('base64'), width: 1024, height: 1024 }],
+        usage: {}
+    }));
+    assert.deepEqual(fromB64, { model: 'gpt-image-2', url: png.toString('base64') });
 });

@@ -195,16 +195,35 @@ Content-Type: application/json
 - `response_format`：期望的返回形式，例如 `url` 或 `b64_json`。
 - `images`：图生图参考图，可使用 Base64、data URL 或 HTTPS URL。文生图应省略；没有参考图时不发送空数组。
 
-下游图片返回建议格式：
+下游图片返回格式（只有 `model` 与 `url` 两个字段，`url` 承载图片本身）：
 
 ```json
-{
-  "model": "logical-image-model-name",
-  "url": "base64、data URL 或 HTTPS URL"
-}
+{ "model": "logical-image-model-name", "url": "https://.../a.png" }
 ```
 
-图片接口同步返回，不创建视频任务，也不使用轮询流程。映射应优先把结果归一到顶层 `url`；Base64 结果也可归一到顶层 `b64_json`。为兼容 OpenAI 风格调用方，响应还可保留 `data[0].url` 或 `data[0].b64_json`，但不能要求插件只解析未归一的上游结构。
+```json
+{ "model": "logical-image-model-name", "url": "iVBORw0KGgoAAAANSUhEUg..." }
+```
+
+图片接口同步返回，不创建视频任务，也不使用轮询流程。`url` 的语义由下游的 `response_format` 决定，
+但两种形态都放在同一个字段里，插件不需要为 base64 再找别的键：链接就是 http(s) 地址，
+base64 就是**裸 base64**（不带 `data:image/...;base64,` 前缀）。没有图片时（空响应 / 错误体）
+`url` 是空字符串，响应结构保持 `{ model, url }` 不变。
+
+- `response_format: "url"`：上游返回 `data[0].url`，映射成 `url`（http 链接）。
+- `response_format: "b64_json"`：上游返回的响应里**根本没有 `url` 字段**，图片只在
+  `data[0].b64_json` 里。此时把 base64 原样放进 `url`，否则下游只会收到
+  `{ "model": ..., "created": ... }`，图片信息整段丢失
+  （gpt-image-2 / gpt-image-2.5 的历史故障就是这个原因：旧映射只取 `data[0].url`）。
+- 上游把图放在 data URL（`data:image/png;base64,...`）里时，映射会拆掉前缀只留 base64。
+
+图片模型统一用 `scripts/image-response-mapping.js` 的 `buildImageResponseMapping(逻辑模型名)`
+生成 `resp_mapping`，它同时兼容 OpenAI `data[]` / `image.data[]` / `image_urls[]` /
+`image.url`、chat 形态的 Markdown 图片与裸 base64，并保证：`url` 有链接时优先给链接、
+没有链接时给 base64、非图片文本（错误话术）不会变成假链接。
+渠道开关 `convert_resp_base64_to_url=1` 时，网关会在映射之后再把这个 base64 `url`
+换成图床链接（第 5 节「图床」），所以这类渠道对下游仍然只返回链接。
+
 
 新增图片模型时同样遵循统一字段到上游字段的映射原则。若上游是 OpenAI 兼容图片接口，通常映射 `prompt`、`quality`、`n`、`size`、`response_format`、`images` 即可。若上游需要 multipart，则 `req_mapping` 输出带 `_request_format`、`fields`、`files`、`_file_fields` 的对象，具体以 `server.js` 中 multipart 支持为准。multipart 转换属于网关绑定，不能下放到插件实现。
 
@@ -691,7 +710,7 @@ data URL 结果额外给出 `b64_json`。上游若按 OpenAI 图像接口返回 
 `GET /v1/models` 声明它支持 `openai`、`image-generation`、`image-edits` 三种入口。
 
 本渠道不新增逻辑模型，而是复用既有 `gpt-image-2`，作为渠道「gpt图片生成」
-（`http://154.9.235.100:3006`）之外的第二条绑定：两个渠道共用**完全相同**的
+（`http://154.44.9.233:8010`）之外的第二条绑定：两个渠道共用**完全相同**的
 `req_mapping` / `resp_mapping`，只有 `base_url` 与密钥不同，下游看到的请求与返回格式不变，
 多绑定之间按 `weight` 随机路由。两条映射由 `scripts/sync-gpt-image-2-mapping.js`
 统一同步，改一处即可让两个渠道同时生效。
@@ -750,7 +769,7 @@ data URL 结果额外给出 `b64_json`。上游若按 OpenAI 图像接口返回 
   `content` 数组里 `type=text` 的段（多段用空格拼接，空白段忽略）> 顶层 `text`。
 - 参考图来源：顶层 `images` 与 `content` 数组里的 `image_url.url` **合并**；
   元素可以是 URL/data URL 字符串，也可以是 `{ "url": ... }` 对象；空值被过滤。
-- 无参考图 → 上游 `POST /v1/chat/completions`（提示词进 `messages[0].content`）。
+- 无参考图 → 上游 `POST /v1/images/generations`（JSON，提示词进顶层 `prompt`）。
 - 有参考图 → 上游 `POST /v1/images/edits` multipart，`image` 字段可重复；
   该分支**不会**把 `messages` 带给上游（上游 edits 接口不接受 `messages`）。
 - `size` 支持画幅 `16:9` / `9:16` / `1:1` / `4:3` / `3:4`，换算成
@@ -760,8 +779,10 @@ data URL 结果额外给出 `b64_json`。上游若按 OpenAI 图像接口返回 
   时，网关都会强制补成 `"high"`**，不会把 `null` 或空值透传给上游。
 - `response_format` 下游传字符串 `"url"` 或对象 `{"type":"url"}` **都可以**，
   网关统一归一成上游要求的**字符串**；缺省 `url`（`null` / 空对象也回落 `url`）。
-- 返回归一到顶层 `url`：兼容 OpenAI 风格 `data[0].url` 与 chat/completions 的
-  Markdown 图片 `choices[0].message.content`。
+  **两个上游入口都发字符串**：`images/generations` 与 `images/edits` 的 `response_format`
+  都是 `"url"`，不再发 `{"type":"url"}` 对象（对象形式会被上游 400 拒绝，见下方实测要点）。
+- 返回归一到顶层 `url`：主要走 OpenAI 风格 `data[0].url`；历史上 chat/completions 分支的
+  Markdown 图片 `choices[0].message.content` 仍然兼容。
 
 注意：网关只解析 JSON 请求体（`express.json`），**不接受下游直接发 multipart**。
 下游如果自己拼 `multipart/form-data` 打 `/v1/images/edits`，`req.body` 为空、
@@ -774,7 +795,17 @@ data URL 结果额外给出 `b64_json`。上游若按 OpenAI 图像接口返回 
 - 上游把 `response_format.type` 声明成 **string**。传统写法传 `{"type":"url"}` 会被上游
   400 拒绝：`json: cannot unmarshal object into Go struct field ResponseFormat.response_format.type of type string`。
   这就是本渠道必须把对象归一成字符串的原因；`/v1/images/generations`、`/v1/chat/completions`、
-  `/v1/images/edits` 三个上游入口都要求字符串。
+  `/v1/images/edits` 三个上游入口都要求字符串。chat/completions 分支曾按 OpenAI 习惯发
+  `{"type":"url"}` 对象（上游会 400），现在文生图已改发 `images/generations`，不再走 chat。
+- **文生图为什么发 `images/generations` 而不是 `chat/completions`**（2026-10 实测）：
+  同一个提示词，上游 `images/generations` 按 `response_format="url"` 返回
+  `data[0].url` 的 **http 链接**（形如 `http://154.44.9.233:8010/images/2026/10/15/xxx.png`）；
+  而 `chat/completions` 返回的是 `choices[0].message.content` 里的 Markdown，
+  图片本体是**内联 data URL base64**（实测该字段长度可达 1.2 MB）。
+  网关的 `resp_mapping` 对两者都能抽出顶层 `url`，所以下游拿到的就是那段 data URL，
+  表现为「直连上游是 http 链接、经网关是 base64」。下游要链接，就发下游实际期望的接口，
+  因此文生图统一改走 `images/generations`。注意该渠道
+  `channels.convert_resp_base64_to_url` 为 0，不会把 base64 转成图床链接。
 - 写这个映射时踩到两个 JSONata 2.2.2 的坑，改映射时注意：
   1. 表达式里**不能写 `//` 注释**（会被当成正则起始符，抛
      `Empty regular expressions are not allowed`），说明只能写在模板字符串外面；
@@ -841,9 +872,12 @@ HTTPS 渠道依赖容器内的 CA 证书库。本仓库 `Dockerfile` 使用
 文件上传，`data:image/...` 先经渠道开关 `convert_base64_to_url=1` 换成图床链接），
 `filename` 固定 `image-1` / `image-2`…，part 的 content-type 取下载时的真实类型。
 
-响应侧：优先取 `data[0].url`；上游只回 `data[0].b64_json` 时映射成 data URL，再由渠道开关
-`convert_resp_base64_to_url=1` 换成图床 HTTPS 链接返回下游（上游本来就给链接时不做改动）；
-仍兼容 chat 分支的 Markdown 图片 `![alt](url)`；空响应 / 错误体不会凭空造链接。
+响应侧：改用统一映射 `scripts/image-response-mapping.js`（见 11.13），响应固定为
+`{ "model": ..., "url": ... }`：
+`response_format=url` 时 `url` 是 http 链接（`data[0].url` / `image_urls[]` / chat 的 Markdown 图片都兼容）；
+`response_format=b64_json` 时 `url` 是裸 base64（取自 `data[0].b64_json`，或从 data URL 里拆出来）。
+Klong 渠道的 `convert_resp_base64_to_url=0`，所以下游要 base64 就直接从 `url` 拿到 base64。
+空响应 / 错误体不会凭空造链接（`url` 为空字符串）。
 
 模板与映射位于 `scripts/duolapi-gpt-image-2-config.js`，写入脚本为
 `scripts/update-duolapi-gpt-image-2.js`（`--dry-run` 预览 / `--apply` 写入；
@@ -967,7 +1001,7 @@ multipart 分支的 data URL 参考图由网关自己的 multipart 构造直接�
 `GET /v1/models` 返回 `gpt-image-2`、`gpt-image-2.5`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`，
 声明入口 `["image-generation", "openai"]`。
 
-本渠道复用既有逻辑模型 `gpt-image-2`，作为「gpt图片生成」（`http://154.9.235.100:3006`）、
+本渠道复用既有逻辑模型 `gpt-image-2`，作为「gpt图片生成」（`http://154.44.9.233:8010`）、
 「gpt图片生成 Klong」（`https://api.klong.lat`）之外的另一条绑定：三者共用**完全相同**的
 `req_mapping`，下游请求与返回格式不变，多绑定之间按 `weight` 随机路由。
 
@@ -975,8 +1009,8 @@ multipart 分支的 data URL 参考图由网关自己的 multipart 构造直接�
 
 与「gpt图片生成」逐字相同，下游两种形态都支持：
 
-- 无参考图 → 上游 `POST /v1/chat/completions`：`model` 固定 `gpt-image-2`，
-  `response_format` 是 `{"type":"url"}` 对象，`messages[0].content` 是提示词字符串。
+- 无参考图 → 上游 `POST /v1/images/generations`：JSON，`model` 固定 `gpt-image-2`，
+  `response_format` 是字符串 `"url"`，提示词在顶层 `prompt`。
 - 有参考图 → 上游 `POST /v1/images/edits` multipart：`image` 字段可重复，
   该分支不发送 `messages`。
 
@@ -985,22 +1019,22 @@ multipart 分支的 data URL 参考图由网关自己的 multipart 构造直接�
 
 #### 返回形态与 base64 转链接
 
-`resp_mapping` 在 Klong 那版基础上扩展，把下面这些形态都归一到顶层 `url`（同时保留
-`b64_json` 与 `data[0]`）：
+响应侧使用统一映射 `scripts/image-response-mapping.js`（见 11.13），响应固定为
+`{ "model": ..., "url": ... }`：有链接时 `url` 是 http 链接，只有 base64 时 `url` 是裸 base64。
 
 - OpenAI 风格 `data[0].url` / `data[0].b64_json`（含 `image.data[0].*`、`image.url`、`image_urls[]`）。
-- `choices[0].message.content` 里的 Markdown 图片 `![alt](https://...)`。
-- `choices[0].message.content` 直接是 `data:image/...` 或裸 base64。
-- `content` 是数组时取其中的文本段。
+- `choices[0].message.content` 里的 Markdown 图片 `![alt](https://...)` 或 data URL。
+- `choices[0].message.content` 直接是 `data:image/...` 或裸 base64（`content` 是数组时取文本段）。
 
 上游按 base64 返回图片，因此本渠道把渠道开关 `convert_resp_base64_to_url` 设为 `1`：
-网关在响应映射之后把 `data:image/...`、裸 base64 与 Markdown 里的 data URL 上传到
-图床（Zipline `files.mmg.lat`，见第 5 节「图床」），换成 HTTPS 链接再返回下游。
-下游看到的 `url` 永远是 http 链接，与「gpt图片生成」渠道一致；上游返回的本来就是链接时不做改动。
+网关在响应映射之后把 `url` 里的 base64 上传到图床（Zipline `files.mmg.lat`，见第 5 节「图床」），
+换成 HTTPS 链接再返回下游。下游看到的 `url` 永远是 http 链接，与「gpt图片生成」渠道一致；
+上游返回的本来就是链接时不做改动。需要 base64 原样返回的渠道请用
+`convert_resp_base64_to_url=0` 的绑定。
 
 限流时上游会回 HTTP 429 `上游返回频率限制，请稍后重试`，或 200 + `choices[0].message.content`
 里的一句「未能生成图片」错误话术。后者**不会**被当成图片：映射只在 content 是 Markdown 图片、
-data URL 或整段裸 base64 时才把它填进 `url`，否则 `url` 为空字符串。
+data URL 或整段裸 base64 时才取图，否则 `url` 是空字符串。
 
 #### 响应侧转换的实现要点（server.js）
 
@@ -1779,5 +1813,81 @@ SSE），所以对 SSE 上游不可用。现在加了一组**按绑定可选**�
 标量，导致 `contents` / `parts` 变成对象而不是数组（Gemini 要求数组）。修法是显式用数组构造器
 包一层：`[$map(...)]`、`[$filter($map(...), ...)]`；`$join(undefined, "")` 返回 `undefined`，
 要再判一次 `$type(...) = "string"` 才能保证 `content` 恒为字符串。
+
+### 11.13 图片 b64_json 返回契约（gpt-image-2 / gpt-image-2.5）
+
+#### 故障现象
+
+下游用 `response_format: "b64_json"` 请求 `gpt-image-2` / `gpt-image-2.5`，网关只返回：
+
+```json
+{ "model": "gpt-image-2.5", "created": 1792232414 }
+```
+
+没有任何图片数据。原因不是上游没给图，而是**响应映射把图丢了**：这两个模型的旧
+`resp_mapping` 只取 `data[0].url`，而上游在 `response_format=b64_json` 时返回的是
+
+```json
+{
+  "created": 1792232414,
+  "data": [{ "revised_prompt": "a red dot", "b64_json": "iVBORw0KG…", "width": 1254, "height": 1254 }],
+  "usage": {}
+}
+```
+
+—— 没有 `url` 字段，于是 JSONata 里 `url` 求值为 `undefined` 被丢掉，只剩 `model` / `created`。
+
+#### 修法
+
+`scripts/image-response-mapping.js` 提供 `buildImageResponseMapping(逻辑模型名)`，生成的
+`resp_mapping` 按第 4 节契约只输出两个字段：
+
+```json
+{ "model": "gpt-image-2.5", "url": "iVBORw0KG…" }
+```
+
+```json
+{ "model": "gpt-image-2.5", "url": "http://154.36.173.116:3006/images/2026/10/17/xxx.png" }
+```
+
+- `url` 模式：`data[0].url`（以及 `image.data[0].url` / `image_urls[]` / `image.url` /
+  chat 的 Markdown 图片）放进 `url`。
+- `b64_json` 模式：`data[0].b64_json` 原样放进 `url`（裸 base64，不带 data URL 前缀）；
+  若上游把 data URL 放在 `data[0].url`（部分渠道这样），也会拆成裸 base64。
+- 同时有链接和 base64 时优先给链接。
+- 取不到图（空响应 / 错误话术「未能生成图片」）时 `url` 是空字符串，结构仍是 `{ model, url }`。
+- **只有 `model` 与 `url`**：不再返回 `created` / `b64_json` / `data`。
+
+用到的模板与脚本：
+
+- 配置：`scripts/klong-gpt-image-2-config.js`、`scripts/img688-gpt-image-2-config.js`（gpt-image-2）、
+  `scripts/gpt-image-25-new-channel-config.js`（gpt-image-2.5）、
+  `scripts/gpt-image-ad-config.js`（gpt-image-2）都改为调用该模块，不再各自维护一份响应映射。
+- 数据库同步：`scripts/sync-image-response-mapping.js`
+  （`--dry-run` 预览 / `--apply` 写入；要求显式设置 `EXPECTED_DB_HOST` 与 `EXPECTED_DB_NAME`）。
+  它只处理逻辑模型名**精确等于** `gpt-image-2` / `gpt-image-2.5` 的绑定，**默认只改已启用的绑定**
+  （`model_bindings.status=1` 且 `channels.status=1`，停用的保持原样，确需一起改加
+  `--include-disabled`），跳过异步绑定（`is_async=1` 或真正的 `poll_mapping`），
+  只更新 `resp_mapping` 一列，可重复执行。
+  映射存在数据库里，所以改完**不需要重启容器**，下一个请求就生效。
+- 测试：`node --test test/image-response-mapping.test.js`（映射本身），以及
+  `test/klong-gpt-image-2.test.js` / `test/img688-gpt-image-2.test.js` /
+  `test/gpt-image-25-new-channel.test.js` / `test/gpt-image-ad.test.js` 里的响应归一断言。
+- 端到端校验：`node tools/verify-image-b64-response.js [网关地址] [网关密钥] [模型...]`
+  （会发起真实生成请求；断言 b64 模式下 `url` 能 base64 解码成 PNG/JPEG/WEBP，url 模式下是 http 链接）。
+
+#### 实测（2026-10，经 Docker 网关 127.0.0.1:3009）
+
+- 上游 `POST /v1/images/generations` + `response_format: "b64_json"` 原始返回：
+  `keys = [created, data, usage]`，`data[0] = {revised_prompt, b64_json, width, height}`（b64 约 1.3MB）。
+- 上游 `POST /v1/chat/completions` + `response_format: {"type":"b64_json"}` 原始返回：
+  `choices[0].message.content = "![image_1](data:image/png;base64,…)"`（Markdown + data URL）。
+- 经网关：`gpt-image-2.5` / `gpt-image-2` 的 `b64_json` 请求都返回 `{ model, url: "<裸 base64>" }`；
+  `url` 请求返回 `{ model, url: "<http 链接>" }`（回归通过）。
+- 返回体只承载一份图片数据（不再同时给 `b64_json` 与 `data[0]`），响应体积 ≈ base64 长度。
+- 只对已启用绑定生效：`gpt-image-2` 的 #210 / #289、`gpt-image-2.5` 的 #58 / #270；
+  停用绑定的 `resp_mapping` 保持原样，需要时用 `--include-disabled` 一并更新。
+
+
 
 

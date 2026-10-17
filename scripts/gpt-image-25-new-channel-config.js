@@ -30,6 +30,8 @@ const API_KEY = process.env.NEW_IMAGE_API_KEY || 'sk-F4LDJcn1b5s5JVB0gTHWS7Z75MI
 const LOGICAL_MODEL_NAME = 'gpt-image-2.5';
 const UPSTREAM_MODEL_NAME = process.env.NEW_IMAGE_UPSTREAM_MODEL || 'gpt-image-2.5';
 
+const { buildImageResponseMapping } = require('./image-response-mapping');
+
 const channels = [
     {
         name: 'gpt-image-2.5 新渠道',
@@ -103,20 +105,11 @@ const req_mapping = `(
   }
 )`;
 
-// 按文档第 4 节：优先顶层 url，其次 b64_json；同时保留 data[0] 兼容 OpenAI 风格调用方。
-const resp_mapping = `(
-  $markdown := $exists(choices) and $count(choices) > 0 ? $substringBefore($substringAfter($string(choices[0].message.content), "]("), ")") : "";
-  $url := $exists(data[0].url) ? $string(data[0].url)
-    : ($exists(image.data[0].url) ? $string(image.data[0].url)
-    : ($exists(image_urls) and $count(image_urls) > 0 ? $string(image_urls[0]) : $markdown));
-  $b64 := $exists(data[0].b64_json) ? data[0].b64_json : ($exists(image.data[0].b64_json) ? image.data[0].b64_json : null);
-  {
-    "model": "${LOGICAL_MODEL_NAME}",
-    "url": $url,
-    "b64_json": $b64,
-    "data": [{ "url": $url, "b64_json": $b64 }]
-  }
-)`;
+// 按文档第 4 节统一归一（scripts/image-response-mapping.js），响应只有 { model, url }：
+//   - response_format=url 时 url 是 data[0].url 里的 http 链接；
+//   - response_format=b64_json 时上游**只给 data[0].b64_json（没有 url）**，
+//     此时 url 就是裸 base64，否则下游只剩 { model, created }。
+const resp_mapping = buildImageResponseMapping(LOGICAL_MODEL_NAME);
 
 const models = [
     {
@@ -129,7 +122,8 @@ const models = [
             + 'size 支持画幅 16:9 / 9:16 / 1:1 / 4:3 / 3:4（换算成 1792x1024 / 1024x1792 / 1024x1024 / 1536x1152 / 1152x1536），'
             + '其他值原样透传，缺省 1024x1024；quality 缺省 high，n 缺省 1；'
             + 'response_format 传字符串或 {type:...} 对象都归一成上游要的字符串，缺省 url。'
-            + '返回按文档第 4 节归一到顶层 url（同时保留 data[0].url / b64_json）。'
+            + '返回只有 { model, url }：url 模式给 http 链接；b64_json 模式把裸 base64 放进 url'
+            + '（上游 b64 响应里没有 url，旧映射会丢失图片信息）。'
             + '实测注意：该上游 /v1/chat/completions 不接受 response_format（对象与字符串都会 400），'
             + '因此本绑定不走 chat 接口；且上游有 5 分钟超时，请求必须带齐 quality 等参数，否则可能 504。'
     }

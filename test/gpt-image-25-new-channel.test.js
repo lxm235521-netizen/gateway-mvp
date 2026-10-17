@@ -158,22 +158,17 @@ test('画幅换算与未知尺寸透传', async () => {
     assert.equal((await mapping.evaluate({ prompt: 'x', size: '2048x2048' })).size, '2048x2048');
 });
 
-test('返回按文档第 4 节归一：顶层 url + data[0]，兼容多种上游形状', async () => {
-    // 本渠道实测的两个路由都返回 data[0].url
+test('返回按文档第 4 节归一：url 模式给链接，b64_json 模式把 base64 放进 url', async () => {
+    // 本渠道实测：response_format=url 时两个路由都返回 data[0].url
     assert.deepEqual(plain(await response.evaluate({
         created: 1791167407,
         data: [{ url: 'https://open.kcai.asia/images/a.png' }]
-    })), {
-        model: 'gpt-image-2.5',
-        url: 'https://open.kcai.asia/images/a.png',
-        b64_json: null,
-        data: [{ url: 'https://open.kcai.asia/images/a.png', b64_json: null }]
-    });
+    })), { model: 'gpt-image-2.5', url: 'https://open.kcai.asia/images/a.png' });
 
     // chat 风格：Markdown 图片
-    assert.equal((await response.evaluate({
+    assert.deepEqual(plain(await response.evaluate({
         choices: [{ message: { content: '![generated image 1](https://open.kcai.asia/images/b.png)' } }]
-    })).url, 'https://open.kcai.asia/images/b.png');
+    })), { model: 'gpt-image-2.5', url: 'https://open.kcai.asia/images/b.png' });
 
     // chat 风格的顶层 image.data[0].url
     assert.equal((await response.evaluate({
@@ -184,8 +179,20 @@ test('返回按文档第 4 节归一：顶层 url + data[0]，兼容多种上游
     // image_urls[]
     assert.equal((await response.evaluate({ image_urls: ['https://open.kcai.asia/images/d.png'] })).url, 'https://open.kcai.asia/images/d.png');
 
-    // b64 结果：顶层 url 为空、b64_json 有值
-    const b64 = plain(await response.evaluate({ data: [{ b64_json: 'AAAA' }] }));
-    assert.equal(b64.b64_json, 'AAAA');
-    assert.equal(b64.url, '');
+    // response_format=b64_json：上游只回 data[0].b64_json，没有 url —— 下游的 url 字段就是 base64
+    const b64Json = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const b64 = plain(await response.evaluate({
+        created: 1791167407,
+        data: [{ revised_prompt: '一只猫', b64_json: b64Json, width: 1254, height: 1254 }],
+        usage: {}
+    }));
+    assert.deepEqual(b64, { model: 'gpt-image-2.5', url: b64Json });
+
+    // 上游把图放进 data URL 时同样拆成裸 base64
+    assert.equal((await response.evaluate({
+        data: [{ url: `data:image/png;base64,${b64Json}` }]
+    })).url, b64Json);
+
+    // 空响应 / 错误体拿不到图时 url 是空串，响应结构不变
+    assert.deepEqual(plain(await response.evaluate({})), { model: 'gpt-image-2.5', url: '' });
 });

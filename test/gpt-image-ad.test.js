@@ -133,7 +133,7 @@ test('图生图：/v1/images/edits 的 multipart（fields + 可重复 image 文�
     assert.equal((await evaluate(cfg.req_mapping, { prompt: 'x', images: [] }))._route_path, '/v1/images/generations');
 });
 
-test('响应归一：上游 data URL 原样进 url（由渠道开关换图床链接），空响应不造链接', async () => {
+test('响应归一：data URL / b64_json 拆成裸 base64 放进 url，url 模式给链接，空响应给空串', async () => {
     const upstream = {
         created: 1792032517,
         background: 'opaque',
@@ -147,15 +147,21 @@ test('响应归一：上游 data URL 原样进 url（由渠道开关换图床链
         quality: 'medium',
         size: '1774x887'
     };
-    const mapped = await evaluate(cfg.resp_mapping, upstream);
-    assert.equal(mapped.model, 'gpt-image-2');
-    assert.equal(mapped.url, 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==');
+    // 上游把图放在 data URL 里：映射拆出裸 base64 放进 url，渠道开关随后会换成图床链接。
+    assert.deepEqual(await evaluate(cfg.resp_mapping, upstream), {
+        model: 'gpt-image-2',
+        url: 'iVBORw0KGgoAAAANSUhEUg=='
+    });
 
-    // 只回 b64_json 的形态也能归一成 data URL（同样会被渠道开关换成链接）。
-    assert.equal((await evaluate(cfg.resp_mapping, { data: [{ b64_json: 'AAAA' }] })).url, 'data:image/png;base64,AAAA');
+    // 只回 b64_json 的形态（response_format=b64_json）同样把 base64 放进 url。
+    assert.deepEqual(await evaluate(cfg.resp_mapping, { data: [{ b64_json: 'AAAA' }] }), {
+        model: 'gpt-image-2',
+        url: 'AAAA'
+    });
     // chat 分支的 Markdown 图片保持兼容。
     assert.equal((await evaluate(cfg.resp_mapping, { choices: [{ message: { content: '![img](https://cdn/y.png)' } }] })).url, 'https://cdn/y.png');
-    // 错误体 / 空响应不造链接。
-    assert.equal((await evaluate(cfg.resp_mapping, {})).url, undefined);
-    assert.equal((await evaluate(cfg.resp_mapping, { error: { message: 'boom' } })).url, undefined);
+    // 错误体 / 空响应不造链接，但结构保持 model + url。
+    for (const payload of [{}, { error: { message: 'boom' } }]) {
+        assert.deepEqual(await evaluate(cfg.resp_mapping, payload), { model: 'gpt-image-2', url: '' });
+    }
 });
